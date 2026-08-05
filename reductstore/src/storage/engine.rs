@@ -569,8 +569,10 @@ impl StorageEngine {
 }
 
 pub(super) fn check_name_convention(name: &str) -> Result<(), ReductError> {
-    let regex = regex::Regex::new(r"^[A-Za-z0-9_-]*$").unwrap();
-    if !regex.is_match(name) {
+    // Compiled once: this runs on every write's bucket/entry resolution.
+    static NAME_REGEX: std::sync::LazyLock<regex::Regex> =
+        std::sync::LazyLock::new(|| regex::Regex::new(r"^[A-Za-z0-9_-]*$").unwrap());
+    if !NAME_REGEX.is_match(name) {
         return Err(unprocessable_entity!(
             "Bucket or entry name can contain only letters, digests and [-,_] symbols",
         ));
@@ -589,8 +591,10 @@ pub(super) fn check_entry_name_convention(name: &str) -> Result<(), ReductError>
         ));
     }
 
-    let regex = regex::Regex::new(r"^[A-Za-z0-9_/-]*$").unwrap();
-    if regex.is_match(name) {
+    // Compiled once: this runs on every write's entry resolution.
+    static ENTRY_REGEX: std::sync::LazyLock<regex::Regex> =
+        std::sync::LazyLock::new(|| regex::Regex::new(r"^[A-Za-z0-9_/-]*$").unwrap());
+    if ENTRY_REGEX.is_match(name) {
         return Ok(());
     }
 
@@ -599,7 +603,7 @@ pub(super) fn check_entry_name_convention(name: &str) -> Result<(), ReductError>
         return Ok(());
     }
     if let Some(parent) = name.strip_suffix("/$meta") {
-        if regex.is_match(parent) {
+        if ENTRY_REGEX.is_match(parent) {
             return Ok(());
         }
     }

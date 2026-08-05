@@ -383,12 +383,82 @@ fn split_keyexprs(raw: &str) -> Vec<String> {
         .collect()
 }
 
+/// How many ingest workers write samples into storage concurrently.
+///
+/// Entries are independent, so per-record storage cost parallelizes across
+/// them; one sequential consumer caps ingest at a few thousand records/s
+/// while telemetry produces multiples of that across dozens of entries.
+/// `RS_ZENOH_INGEST_WORKERS` overrides.
+fn ingest_worker_count() -> usize {
+    std::env::var("RS_ZENOH_INGEST_WORKERS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or_else(|| {
+            std::thread::available_parallelism()
+                .map(|n| n.get().min(8))
+                .unwrap_or(4)
+        })
+}
+
+/// Samples one worker may queue before dispatch blocks. Blocking the
+/// subscriber loop is the backpressure path: zenoh's own channel fills and
+/// the publisher's congestion control takes over, exactly as with a single
+/// consumer — the queue only decouples the workers from each other.
+const INGEST_WORKER_QUEUE: usize = 256;
+
+/// Ingest worker pool. A sample's full key picks its worker
+/// ([`IngestWorkers::dispatch`]), so records of one entry are always written
+/// by the same worker in arrival order — ReductStore requires strictly
+/// increasing timestamps per entry — while distinct entries proceed in
+/// parallel.
+struct IngestWorkers {
+    txs: Vec<tokio::sync::mpsc::Sender<Sample>>,
+}
+
+impl IngestWorkers {
+    fn spawn(
+        pipeline: Arc<SubscriberPipeline>,
+        count: usize,
+    ) -> (Self, Vec<tokio::task::JoinHandle<()>>) {
+        let mut txs = Vec::with_capacity(count);
+        let mut handles = Vec::with_capacity(count);
+        for _ in 0..count {
+            let (tx, mut rx) = tokio::sync::mpsc::channel::<Sample>(INGEST_WORKER_QUEUE);
+            let pipeline = Arc::clone(&pipeline);
+            handles.push(tokio::spawn(async move {
+                while let Some(sample) = rx.recv().await {
+                    let key = sample.key_expr().to_string();
+                    if let Err(e) = handle_sample(&pipeline, sample).await {
+                        warn!("Failed to handle Zenoh sample on '{}': {}", key, e);
+                    }
+                }
+            }));
+            txs.push(tx);
+        }
+        (IngestWorkers { txs }, handles)
+    }
+
+    async fn dispatch(&self, sample: Sample) {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::hash::DefaultHasher::new();
+        sample.key_expr().as_str().hash(&mut hasher);
+        let shard = (hasher.finish() % self.txs.len() as u64) as usize;
+        if self.txs[shard].send(sample).await.is_err() {
+            error!("Zenoh ingest worker {} is gone; sample dropped", shard);
+        }
+    }
+}
+
 async fn spawn_subscribers(
     session: &Session,
     config: &ZenohApiConfig,
     pipeline: Arc<SubscriberPipeline>,
 ) -> Result<Vec<tokio::task::JoinHandle<()>>, SessionError> {
-    let mut handles = Vec::new();
+    let worker_count = ingest_worker_count();
+    info!("Starting {} Zenoh ingest workers", worker_count);
+    let (workers, mut handles) = IngestWorkers::spawn(pipeline, worker_count);
+    let workers = Arc::new(workers);
 
     for key_expr in split_keyexprs(config.sub_keyexprs.as_ref().unwrap()) {
         info!("Declaring Zenoh subscriber on key expression: {}", key_expr);
@@ -403,16 +473,12 @@ async fn spawn_subscribers(
                 ))
             })?;
 
-        let pipeline_clone = Arc::clone(&pipeline);
+        let workers = Arc::clone(&workers);
 
         let handle = tokio::spawn(async move {
             loop {
                 match subscriber.recv_async().await {
-                    Ok(sample) => {
-                        if let Err(e) = handle_sample(&pipeline_clone, sample).await {
-                            warn!("Failed to handle Zenoh sample on '{}': {}", key_expr, e);
-                        }
-                    }
+                    Ok(sample) => workers.dispatch(sample).await,
                     Err(e) => {
                         error!("Subscriber '{}' recv error: {}", key_expr, e);
                         break;

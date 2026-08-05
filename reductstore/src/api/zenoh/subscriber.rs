@@ -16,9 +16,76 @@ use reduct_base::Labels;
 use std::collections::HashSet;
 use std::error::Error;
 use std::fmt::{Display, Formatter};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
-use tokio::sync::Mutex;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
+
+/// Per-stage ingest timing, accumulated across all samples and logged every
+/// [`INGEST_STATS_EVERY`] records when `RS_ZENOH_INGEST_STATS` is set. The
+/// counters answer "where does an ingested record's time go" on a live
+/// instance without a profiler.
+#[derive(Default)]
+struct IngestStats {
+    records: AtomicU64,
+    limits_us: AtomicU64,
+    begin_write_us: AtomicU64,
+    send_us: AtomicU64,
+    replication_us: AtomicU64,
+}
+
+const INGEST_STATS_EVERY: u64 = 5_000;
+
+static INGEST_STATS: IngestStats = IngestStats {
+    records: AtomicU64::new(0),
+    limits_us: AtomicU64::new(0),
+    begin_write_us: AtomicU64::new(0),
+    send_us: AtomicU64::new(0),
+    replication_us: AtomicU64::new(0),
+};
+
+fn ingest_stats_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("RS_ZENOH_INGEST_STATS").is_ok())
+}
+
+struct StageTimer(Option<Instant>);
+
+impl StageTimer {
+    fn start() -> Self {
+        StageTimer(ingest_stats_enabled().then(Instant::now))
+    }
+
+    /// Adds the time since the last lap to `stage` and restarts the clock.
+    fn lap(&mut self, stage: &AtomicU64) {
+        if let Some(start) = self.0.as_mut() {
+            let now = Instant::now();
+            stage.fetch_add(
+                now.duration_since(*start).as_micros() as u64,
+                Ordering::Relaxed,
+            );
+            *start = now;
+        }
+    }
+
+    /// Counts the record and logs the accumulated per-stage split periodically.
+    fn finish(self) {
+        if self.0.is_none() {
+            return;
+        }
+        let n = INGEST_STATS.records.fetch_add(1, Ordering::Relaxed) + 1;
+        if n % INGEST_STATS_EVERY == 0 {
+            let per = |stage: &AtomicU64| stage.load(Ordering::Relaxed) / n;
+            info!(
+                "zenoh ingest stats after {n} records (avg us/record): limits={} begin_write={} \
+                 send={} replication={}",
+                per(&INGEST_STATS.limits_us),
+                per(&INGEST_STATS.begin_write_us),
+                per(&INGEST_STATS.send_us),
+                per(&INGEST_STATS.replication_us),
+            );
+        }
+    }
+}
 
 /// Subscriber pipeline for ingesting Zenoh samples into ReductStore.
 ///
@@ -30,8 +97,9 @@ pub(crate) struct SubscriberPipeline {
     components: Arc<Components>,
     routing: BucketRouting,
     /// Buckets already verified/created by this pipeline, so the common path
-    /// skips the storage lookup.
-    known_buckets: Mutex<HashSet<String>>,
+    /// skips the storage lookup. A std RwLock: checked on every ingested
+    /// record by every worker, so the hit path must be a shared read.
+    known_buckets: std::sync::RwLock<HashSet<String>>,
 }
 
 impl SubscriberPipeline {
@@ -39,7 +107,7 @@ impl SubscriberPipeline {
         SubscriberPipeline {
             components,
             routing: BucketRouting::from_config(&config),
-            known_buckets: Mutex::new(HashSet::new()),
+            known_buckets: std::sync::RwLock::new(HashSet::new()),
         }
     }
 
@@ -47,8 +115,7 @@ impl SubscriberPipeline {
     /// sight. Only consulted in key-prefix mode; static mode's bucket is
     /// ensured once at session startup.
     async fn ensure_bucket(&self, bucket: &str) -> Result<(), ReductError> {
-        let mut known = self.known_buckets.lock().await;
-        if known.contains(bucket) {
+        if self.known_buckets.read().unwrap().contains(bucket) {
             return Ok(());
         }
         if self.components.storage.get_bucket(bucket).await.is_err() {
@@ -64,7 +131,10 @@ impl SubscriberPipeline {
                 Err(err) => return Err(err),
             }
         }
-        known.insert(bucket.to_string());
+        self.known_buckets
+            .write()
+            .unwrap()
+            .insert(bucket.to_string());
         Ok(())
     }
 
@@ -100,6 +170,7 @@ impl SubscriberPipeline {
 
         let ts = timestamp.unwrap_or_else(|| current_time_us());
         let content_size = payload.len() as u64;
+        let mut timer = StageTimer::start();
 
         self.components
             .limits
@@ -113,6 +184,7 @@ impl SubscriberPipeline {
         if self.routing.is_dynamic() {
             self.ensure_bucket(bucket).await?;
         }
+        timer.lap(&INGEST_STATS.limits_us);
 
         debug!(
             "Ingesting Zenoh sample bucket={} entry={} timestamp={} bytes={} content_type={}",
@@ -131,12 +203,16 @@ impl SubscriberPipeline {
                 labels.clone(),
             )
             .await?;
+        timer.lap(&INGEST_STATS.begin_write_us);
 
         writer.send(Ok(Some(payload))).await?;
         writer.send(Ok(None)).await?;
+        timer.lap(&INGEST_STATS.send_us);
 
         self.notify_replication(bucket, entry_name, ts, labels)
             .await?;
+        timer.lap(&INGEST_STATS.replication_us);
+        timer.finish();
 
         Ok(())
     }
