@@ -7,12 +7,12 @@ impl BlockManager {
     pub async fn save_cache_on_disk(&mut self) -> Result<(), ReductError> {
         let blocks = self.block_cache.write_values();
         for block in blocks.iter() {
-            {
-                let block_id = block.read().await?.block_id();
-                self.sync_data_block(block_id).await?;
-            }
+            let block_id = block.read().await?.block_id();
+            self.sync_data_block(block_id).await?;
+            self.mark_meta_clean(&block_id);
             self.save_meta_on_disk(block.clone()).await?;
         }
+        self.flush_dirty_meta().await?;
 
         Ok(())
     }
@@ -27,20 +27,66 @@ impl BlockManager {
         for block in blocks {
             let block_id = block.read().await?.block_id();
             if blocks_with_wal.contains(&block_id) {
+                self.mark_meta_clean(&block_id);
                 self.save_meta_on_disk(block).await?;
             }
         }
+        self.flush_dirty_meta().await?;
 
         Ok(())
     }
 
     pub async fn save_block(&mut self, block: BlockRef) -> Result<(), ReductError> {
         let id = block.read().await?.block_id();
-        for (_, block) in self.block_cache.insert_write(id, block.clone()) {
+        self.mark_meta_clean(&id);
+        for (evicted_id, block) in self.block_cache.insert_write(id, block.clone()) {
+            self.mark_meta_clean(&evicted_id);
             self.save_meta_on_disk(block).await?;
         }
 
         Ok(())
+    }
+
+    /// Queue `block`'s descriptor for the next metadata flush instead of
+    /// rewriting it now. The caller's WAL entry keeps the deferred state
+    /// recoverable ([`crate::storage::entry::entry_loader`] replays retained
+    /// WALs on load), and readers see the fresh in-memory block through the
+    /// write cache. A block evicted from the write cache is persisted on the
+    /// spot so the dirty set stays a subset of the cache.
+    pub(super) async fn defer_meta_save(&mut self, block: BlockRef) -> Result<(), ReductError> {
+        let id = block.read().await?.block_id();
+        for (evicted_id, evicted) in self.block_cache.insert_write(id, block.clone()) {
+            self.mark_meta_clean(&evicted_id);
+            self.save_meta_on_disk(evicted).await?;
+        }
+        if self.dirty_meta.is_empty() {
+            self.first_dirty_at = Instant::now();
+        }
+        self.dirty_meta.insert(id, block);
+        self.dirty_records += 1;
+
+        if self.dirty_records >= super::meta_flush_max_records()
+            || self.first_dirty_at.elapsed() >= super::meta_flush_max_age()
+        {
+            self.flush_dirty_meta().await?;
+        }
+        Ok(())
+    }
+
+    /// Write out every deferred block descriptor (and with each, the block
+    /// index); their WALs are removed as they land.
+    pub(crate) async fn flush_dirty_meta(&mut self) -> Result<(), ReductError> {
+        for (_, block) in std::mem::take(&mut self.dirty_meta) {
+            self.save_meta_on_disk(block).await?;
+        }
+        self.dirty_records = 0;
+        Ok(())
+    }
+
+    /// Drop a block from the deferred set because its descriptor is being
+    /// written (or removed) through another path.
+    pub(super) fn mark_meta_clean(&mut self, block_id: &u64) {
+        self.dirty_meta.remove(block_id);
     }
 
     pub(super) async fn sync_data_block(&self, block_id: u64) -> Result<(), ReductError> {

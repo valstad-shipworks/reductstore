@@ -14,3 +14,4 @@ __pycache__
 .kilo/*
 !.kilo/skills/
 !.kilo/skills/**
+target-baseline/

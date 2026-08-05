@@ -60,6 +60,7 @@ impl BlockManager {
             data_block.set_len(block_size)?;
         }
 
+        self.mark_meta_clean(&block_id);
         self.save_meta_on_disk(block.clone()).await?;
 
         let sync_block = async move {
@@ -117,6 +118,7 @@ impl BlockManager {
     ///
     /// * `ReductError` - If the block is still in use or file system operation failed.
     pub async fn remove_block(&mut self, block_id: u64) -> Result<(), ReductError> {
+        self.mark_meta_clean(&block_id);
         self.wal.append(block_id, WalEntry::RemoveBlock).await?;
 
         let data_block_path = self.path_to_data(block_id);

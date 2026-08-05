@@ -62,6 +62,48 @@ pub(in crate::storage) struct BlockManager {
     cfg: Arc<Cfg>,
     usage_counters: Arc<UsageCounters>,
     last_replica_sync: Instant,
+    /// Blocks whose in-memory descriptor is ahead of its on-disk copy
+    /// ([`Self::defer_meta_save`]). Their WAL entries are retained until the
+    /// next flush, so a crash replays them on load; readers stay on the fresh
+    /// in-memory block because the dirty set is kept a subset of the write
+    /// cache, which lookups consult before disk.
+    dirty_meta: std::collections::HashMap<u64, BlockRef>,
+    /// Records finished since the last metadata flush, for the flush policy.
+    dirty_records: usize,
+    /// When the oldest unflushed record was finished; meaningful only while
+    /// `dirty_meta` is non-empty.
+    first_dirty_at: Instant,
+}
+
+/// Finished records between two metadata flushes. Writing the descriptor and
+/// index per record costs several serialized file-cache operations each; a
+/// batch amortizes them while the per-record WAL entry keeps every deferred
+/// record recoverable. `RS_ENGINE_META_FLUSH_RECORDS` overrides.
+fn meta_flush_max_records() -> usize {
+    static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("RS_ENGINE_META_FLUSH_RECORDS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .filter(|n| *n > 0)
+            .unwrap_or(256)
+    })
+}
+
+/// Longest a finished record's metadata may stay unflushed while records keep
+/// arriving; an idle entry is flushed by the periodic compaction pass and at
+/// shutdown regardless. `RS_ENGINE_META_FLUSH_AGE_MS` overrides.
+fn meta_flush_max_age() -> Duration {
+    static V: std::sync::OnceLock<Duration> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        Duration::from_millis(
+            std::env::var("RS_ENGINE_META_FLUSH_AGE_MS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .filter(|n| *n > 0)
+                .unwrap_or(250),
+        )
+    })
 }
 
 pub const DESCRIPTOR_FILE_EXT: &str = ".meta";
@@ -110,6 +152,9 @@ impl BlockManager {
             cfg,
             usage_counters,
             last_replica_sync: Instant::now(),
+            dirty_meta: std::collections::HashMap::new(),
+            dirty_records: 0,
+            first_dirty_at: Instant::now(),
         })
     }
 }
