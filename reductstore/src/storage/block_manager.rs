@@ -62,6 +62,37 @@ pub(in crate::storage) struct BlockManager {
     cfg: Arc<Cfg>,
     usage_counters: Arc<UsageCounters>,
     last_replica_sync: Instant,
+    /// Blocks with a deferred descriptor write ([`Self::defer_meta_save`]);
+    /// kept a subset of the write cache, with their WALs retained until flush.
+    dirty_meta: std::collections::HashMap<u64, BlockRef>,
+    dirty_records: usize,
+    first_dirty_at: Instant,
+}
+
+/// Max finished records between metadata flushes; `RS_ENGINE_META_FLUSH_RECORDS` overrides.
+fn meta_flush_max_records() -> usize {
+    static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("RS_ENGINE_META_FLUSH_RECORDS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .filter(|n| *n > 0)
+            .unwrap_or(256)
+    })
+}
+
+/// Max age of unflushed metadata while records keep arriving; `RS_ENGINE_META_FLUSH_AGE_MS` overrides.
+fn meta_flush_max_age() -> Duration {
+    static V: std::sync::OnceLock<Duration> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        Duration::from_millis(
+            std::env::var("RS_ENGINE_META_FLUSH_AGE_MS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .filter(|n| *n > 0)
+                .unwrap_or(250),
+        )
+    })
 }
 
 pub const DESCRIPTOR_FILE_EXT: &str = ".meta";
@@ -110,6 +141,9 @@ impl BlockManager {
             cfg,
             usage_counters,
             last_replica_sync: Instant::now(),
+            dirty_meta: std::collections::HashMap::new(),
+            dirty_records: 0,
+            first_dirty_at: Instant::now(),
         })
     }
 }
