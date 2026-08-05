@@ -491,7 +491,19 @@ impl<EnvGetter: GetEnv, ExtCfg: ExtCfgBounds> CfgParser<EnvGetter, ExtCfg> {
         })?;
 
         FILE_CACHE.set_storage_backend(backend).await;
-        FILE_CACHE.set_sync_interval(self.cfg.backend_config.sync_interval);
+        // Minimum age before a dirty file is fsynced again by the cache's
+        // sync pass. The backend default is zero — every dirty file, every
+        // pass — which saturates disks with slow flushes (a consumer NVMe
+        // takes ~5 ms per fdatasync) and stalls writers on the file locks the
+        // pass holds. Pacing widens the power-loss window for buffered data
+        // to the chosen interval; WAL replay and block CRCs already cover
+        // that window's crash consistency.
+        let sync_interval = std::env::var("RS_FS_SYNC_INTERVAL_MS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .map(std::time::Duration::from_millis)
+            .unwrap_or(self.cfg.backend_config.sync_interval);
+        FILE_CACHE.set_sync_interval(sync_interval);
         FILE_CACHE.set_read_only(self.cfg.role == InstanceRole::Replica);
         Ok(())
     }
