@@ -491,7 +491,14 @@ impl<EnvGetter: GetEnv, ExtCfg: ExtCfgBounds> CfgParser<EnvGetter, ExtCfg> {
         })?;
 
         FILE_CACHE.set_storage_backend(backend).await;
-        FILE_CACHE.set_sync_interval(self.cfg.backend_config.sync_interval);
+        // Minimum age before the sync pass re-fsyncs the same dirty file;
+        // the backend default of zero re-syncs every file on every pass.
+        let sync_interval = std::env::var("RS_FS_SYNC_INTERVAL_MS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .map(std::time::Duration::from_millis)
+            .unwrap_or(self.cfg.backend_config.sync_interval);
+        FILE_CACHE.set_sync_interval(sync_interval);
         FILE_CACHE.set_read_only(self.cfg.role == InstanceRole::Replica);
         Ok(())
     }
