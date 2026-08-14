@@ -13,8 +13,72 @@ use reduct_base::io::RecordMeta;
 use reduct_base::Labels;
 use std::error::Error;
 use std::fmt::{Display, Formatter};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
+
+/// Per-stage ingest timing, logged every [`INGEST_STATS_EVERY`] records when
+/// `RS_ZENOH_INGEST_STATS` is set.
+#[derive(Default)]
+struct IngestStats {
+    records: AtomicU64,
+    limits_us: AtomicU64,
+    begin_write_us: AtomicU64,
+    send_us: AtomicU64,
+    replication_us: AtomicU64,
+}
+
+const INGEST_STATS_EVERY: u64 = 5_000;
+
+static INGEST_STATS: IngestStats = IngestStats {
+    records: AtomicU64::new(0),
+    limits_us: AtomicU64::new(0),
+    begin_write_us: AtomicU64::new(0),
+    send_us: AtomicU64::new(0),
+    replication_us: AtomicU64::new(0),
+};
+
+fn ingest_stats_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("RS_ZENOH_INGEST_STATS").is_ok())
+}
+
+struct StageTimer(Option<Instant>);
+
+impl StageTimer {
+    fn start() -> Self {
+        StageTimer(ingest_stats_enabled().then(Instant::now))
+    }
+
+    fn lap(&mut self, stage: &AtomicU64) {
+        if let Some(start) = self.0.as_mut() {
+            let now = Instant::now();
+            stage.fetch_add(
+                now.duration_since(*start).as_micros() as u64,
+                Ordering::Relaxed,
+            );
+            *start = now;
+        }
+    }
+
+    fn finish(self) {
+        if self.0.is_none() {
+            return;
+        }
+        let n = INGEST_STATS.records.fetch_add(1, Ordering::Relaxed) + 1;
+        if n % INGEST_STATS_EVERY == 0 {
+            let per = |stage: &AtomicU64| stage.load(Ordering::Relaxed) / n;
+            info!(
+                "zenoh ingest stats after {n} records (avg us/record): limits={} begin_write={} \
+                 send={} replication={}",
+                per(&INGEST_STATS.limits_us),
+                per(&INGEST_STATS.begin_write_us),
+                per(&INGEST_STATS.send_us),
+                per(&INGEST_STATS.replication_us),
+            );
+        }
+    }
+}
 
 /// Subscriber pipeline for ingesting Zenoh samples into ReductStore.
 ///
@@ -65,6 +129,7 @@ impl SubscriberPipeline {
 
         let ts = timestamp.unwrap_or_else(|| current_time_us());
         let content_size = payload.len() as u64;
+        let mut timer = StageTimer::start();
 
         self.components
             .limits
@@ -74,6 +139,7 @@ impl SubscriberPipeline {
             .limits
             .check_ingress_for(LimitScope::GlobalFallback, content_size)
             .await?;
+        timer.lap(&INGEST_STATS.limits_us);
 
         debug!(
             "Ingesting Zenoh sample bucket={} entry={} timestamp={} bytes={} content_type={}",
@@ -92,12 +158,16 @@ impl SubscriberPipeline {
                 labels.clone(),
             )
             .await?;
+        timer.lap(&INGEST_STATS.begin_write_us);
 
         writer.send(Ok(Some(payload))).await?;
         writer.send(Ok(None)).await?;
+        timer.lap(&INGEST_STATS.send_us);
 
         self.notify_replication(&self.bucket, &entry_name, ts, labels)
             .await?;
+        timer.lap(&INGEST_STATS.replication_us);
+        timer.finish();
 
         Ok(())
     }
