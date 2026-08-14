@@ -181,7 +181,7 @@ impl SubscriberPipeline {
     ) -> Result<(), ReductError> {
         self.components
             .replication_repo
-            .write()
+            .read()
             .await?
             .notify(TransactionNotification {
                 bucket: bucket.to_string(),
