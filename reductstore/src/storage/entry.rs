@@ -31,6 +31,7 @@ use reduct_base::msg::status::ResourceStatus;
 use reduct_base::{conflict, internal_server_error, not_found, unprocessable_entity};
 use std::collections::{BTreeSet, HashMap};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 pub(crate) use system::{
@@ -61,6 +62,7 @@ pub(crate) struct Entry {
     bucket_name: String,
     settings: AsyncRwLock<EntrySettings>,
     block_manager: Arc<AsyncRwLock<BlockManager>>,
+    size_counter: Arc<AtomicU64>,
     system_behavior: Box<dyn SystemEntryBehavior + Send + Sync>,
     queries: QueryHandleMapRef,
     status: AsyncRwLock<ResourceStatus>,
@@ -294,9 +296,9 @@ impl Entry {
         Ok(())
     }
 
-    pub async fn size(&self) -> Result<u64, ReductError> {
-        let bm = self.block_manager.read().await?;
-        Ok(bm.index().size())
+    /// Current size of the entry as tracked by its block index, without locking it.
+    pub fn cached_size(&self) -> u64 {
+        self.size_counter.load(Ordering::Acquire)
     }
 
     /// Try to remove the oldest block.

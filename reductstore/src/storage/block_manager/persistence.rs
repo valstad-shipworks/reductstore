@@ -9,10 +9,8 @@ impl BlockManager {
         for block in blocks.iter() {
             let block_id = block.read().await?.block_id();
             self.sync_data_block(block_id).await?;
-            self.mark_meta_clean(&block_id);
             self.save_meta_on_disk(block.clone()).await?;
         }
-        self.flush_dirty_meta().await?;
 
         Ok(())
     }
@@ -27,61 +25,23 @@ impl BlockManager {
         for block in blocks {
             let block_id = block.read().await?.block_id();
             if blocks_with_wal.contains(&block_id) {
-                self.mark_meta_clean(&block_id);
                 self.save_meta_on_disk(block).await?;
             }
         }
-        self.flush_dirty_meta().await?;
 
         Ok(())
     }
 
     pub async fn save_block(&mut self, block: BlockRef) -> Result<(), ReductError> {
         let id = block.read().await?.block_id();
-        self.mark_meta_clean(&id);
-        for (evicted_id, block) in self.block_cache.insert_write(id, block.clone()) {
-            self.mark_meta_clean(&evicted_id);
-            self.save_meta_on_disk(block).await?;
-        }
-
-        Ok(())
-    }
-
-    /// Queue `block`'s descriptor for the next metadata flush; its WAL entry
-    /// keeps the deferred state recoverable and a block evicted from the
-    /// write cache is persisted on the spot.
-    pub(super) async fn defer_meta_save(&mut self, block: BlockRef) -> Result<(), ReductError> {
-        let id = block.read().await?.block_id();
         for (evicted_id, evicted) in self.block_cache.insert_write(id, block.clone()) {
-            self.mark_meta_clean(&evicted_id);
-            self.save_meta_on_disk(evicted).await?;
+            self.save_meta_on_disk(evicted.clone()).await?;
+            // Keep the same Arc reachable: an in-flight writer may still hold it,
+            // and a fresh load from disk would diverge from its in-memory state.
+            self.block_cache.insert_read(evicted_id, evicted);
         }
-        if self.dirty_meta.is_empty() {
-            self.first_dirty_at = Instant::now();
-        }
-        self.dirty_meta.insert(id, block);
-        self.dirty_records += 1;
 
-        if self.dirty_records >= super::meta_flush_max_records()
-            || self.first_dirty_at.elapsed() >= super::meta_flush_max_age()
-        {
-            self.flush_dirty_meta().await?;
-        }
         Ok(())
-    }
-
-    /// Write out every deferred block descriptor and release its WAL.
-    pub(crate) async fn flush_dirty_meta(&mut self) -> Result<(), ReductError> {
-        for (_, block) in std::mem::take(&mut self.dirty_meta) {
-            self.save_meta_on_disk(block).await?;
-        }
-        self.dirty_records = 0;
-        Ok(())
-    }
-
-    /// Drop a block from the deferred set; its descriptor is handled elsewhere.
-    pub(super) fn mark_meta_clean(&mut self, block_id: &u64) {
-        self.dirty_meta.remove(block_id);
     }
 
     pub(super) async fn sync_data_block(&self, block_id: u64) -> Result<(), ReductError> {
@@ -142,8 +102,10 @@ impl BlockManager {
             let mut lock = FILE_CACHE
                 .write_or_create(&path, SeekFrom::Start(0))
                 .await?;
-            lock.set_len(len)?;
-            lock.write_all(&buf)?;
+            File::run_blocking_io(|| {
+                lock.set_len(len)?;
+                lock.write_all(&buf)
+            })?;
             lock.flush_local().await?; // fix https://github.com/reductstore/reductstore/issues/642
         }
 

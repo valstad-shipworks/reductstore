@@ -95,10 +95,12 @@ impl EntryBuilder {
             block_index.save().await?;
         }
 
+        let size_counter = block_index.size_counter();
         Ok(Entry {
             name: name.clone(),
             bucket_name: bucket_name.clone(),
             settings: AsyncRwLock::new(settings),
+            size_counter,
             block_manager: Arc::new(AsyncRwLock::new(
                 BlockManager::build(
                     path.clone(),

@@ -1,6 +1,7 @@
 // Copyright 2021-2026 ReductSoftware UG
 // Licensed under the Apache License, Version 2.0
 
+pub mod benchmark;
 pub mod io;
 pub mod limits;
 pub mod lock_file;
@@ -17,6 +18,7 @@ use crate::api::limits::{LimitsBuilder, LimitsConfig};
 use crate::asset::asset_manager::create_asset_manager;
 use crate::auth::token_auth::TokenAuthorization;
 use crate::backend::{Backend, BackendType, GeneralBackendConfig};
+use crate::cfg::benchmark::BenchmarkApiConfig;
 use crate::cfg::io::IoConfig;
 use crate::cfg::lock_file::LockFileConfig;
 use crate::cfg::replication::ReplicationConfig;
@@ -137,6 +139,7 @@ pub struct Cfg {
     pub lock_file_config: LockFileConfig,
     pub rw_lock_config: RwLockConfig,
     pub engine_config: StorageEngineConfig,
+    pub benchmark_api: BenchmarkApiConfig,
     pub(crate) limits_config: LimitsConfig,
     #[cfg(feature = "zenoh-api")]
     pub zenoh_api: ZenohApiConfig,
@@ -172,6 +175,7 @@ impl Default for Cfg {
             lock_file_config: LockFileConfig::default(),
             rw_lock_config: RwLockConfig::default(),
             engine_config: StorageEngineConfig::default(),
+            benchmark_api: BenchmarkApiConfig::default(),
             limits_config: LimitsConfig::default(),
             #[cfg(feature = "zenoh-api")]
             zenoh_api: ZenohApiConfig::default(),
@@ -353,6 +357,7 @@ impl<EnvGetter: GetEnv, ExtCfg: ExtCfgBounds> CfgParser<EnvGetter, ExtCfg> {
             lock_file_config: Self::parse_lock_file_config(&mut env),
             rw_lock_config: Self::parse_rw_lock_config(&mut env),
             engine_config,
+            benchmark_api: Self::parse_benchmark_api_config(&mut env),
             limits_config: Self::parse_limits_config(&mut env),
             #[cfg(feature = "zenoh-api")]
             zenoh_api: Self::parse_zenoh_api_config(&mut env),
@@ -695,6 +700,7 @@ mod tests {
         assert_eq!(parser.cfg.cert_key_path, None);
         assert_eq!(parser.cfg.cors_allow_origin.len(), 0);
         assert_eq!(parser.cfg.limits_config, LimitsConfig::default());
+        assert!(!parser.cfg.benchmark_api.enabled);
 
         assert_eq!(parser.cfg.buckets.len(), 0);
         assert_eq!(parser.cfg.bucket_defaults, Bucket::defaults());

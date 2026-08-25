@@ -115,7 +115,12 @@ impl OpenOptions {
 }
 
 impl File {
-    fn run_blocking_io<T>(op: impl FnOnce() -> std::io::Result<T>) -> std::io::Result<T> {
+    /// Runs `op` on the current thread, telling the multi-threaded runtime it
+    /// may block. Nested calls are free, so callers issuing several file
+    /// operations in a row should wrap them in a single call.
+    pub(crate) fn run_blocking_io<T>(
+        op: impl FnOnce() -> std::io::Result<T>,
+    ) -> std::io::Result<T> {
         match Handle::try_current() {
             Ok(handle) if handle.runtime_flavor() == RuntimeFlavor::MultiThread => {
                 tokio::task::block_in_place(op)

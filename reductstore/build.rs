@@ -50,8 +50,9 @@ fn package_web_console() {
     println!("cargo:rerun-if-env-changed=WEB_CONSOLE_BUILD");
     let console_dir = match env::var("WEB_CONSOLE_BUILD") {
         Ok(path) => PathBuf::from(path),
-        Err(_) => Path::new(&env::var("CARGO_MANIFEST_DIR").unwrap())
-            .join("../../reductstore-web/build"),
+        Err(_) => {
+            Path::new(&env::var("CARGO_MANIFEST_DIR").unwrap()).join("../../reductstore-web/build")
+        }
     };
 
     if !console_dir.is_dir() {
@@ -62,8 +63,8 @@ fn package_web_console() {
     }
 
     let out_dir = env::var("OUT_DIR").unwrap();
-    let file = fs::File::create(format!("{}/console.zip", out_dir))
-        .expect("Failed to create console.zip");
+    let file =
+        fs::File::create(format!("{}/console.zip", out_dir)).expect("Failed to create console.zip");
     let mut zip = zip::ZipWriter::new(file);
     add_dir_to_zip(&mut zip, &console_dir, &console_dir);
     zip.finish().expect("Failed to write console.zip");

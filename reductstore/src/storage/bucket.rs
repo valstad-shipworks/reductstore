@@ -20,6 +20,7 @@ use crate::core::weak::Weak;
 pub use crate::storage::block_manager::RecordRx;
 pub use crate::storage::block_manager::RecordTx;
 use crate::storage::bucket::query::MultiEntryQuery;
+use crate::storage::bucket::quotas::FreeSpaceCache;
 use crate::storage::bucket::settings::{DEFAULT_MAX_BLOCK_SIZE, DEFAULT_MAX_RECORDS};
 use crate::storage::entry::{
     is_system_meta_entry, Entry, EntrySettings, META_ENTRY_MAX_BLOCK_SIZE,
@@ -83,6 +84,7 @@ pub(crate) struct Bucket {
     io_limiter: InFlightIoLimiter,
     usage_counters: Arc<UsageCounters>,
     free_space_fn: FreeSpaceFn,
+    free_space_cache: FreeSpaceCache,
 }
 
 #[derive(Copy, Clone, Eq, PartialEq)]
@@ -233,7 +235,7 @@ impl Bucket {
 
         let get_entry = async || {
             self.keep_quota_for(content_size).await?;
-            self.check_free_disk_space(content_size).await?;
+            self.check_free_disk_space(content_size)?;
             self.get_or_create_entry(name).await?.upgrade()
         };
 

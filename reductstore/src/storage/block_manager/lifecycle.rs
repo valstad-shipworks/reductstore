@@ -24,7 +24,7 @@ impl BlockManager {
             }
         }
 
-        self.block_index.insert_or_update(block.clone());
+        self.block_index.insert_or_update(&block);
 
         let block_ref = Arc::new(AsyncRwLock::new(block));
         self.save_block(block_ref.clone()).await?;
@@ -60,8 +60,8 @@ impl BlockManager {
             data_block.set_len(block_size)?;
         }
 
-        self.mark_meta_clean(&block_id);
         self.save_meta_on_disk(block.clone()).await?;
+        self.block_cache.insert_read(block_id, block.clone());
 
         let sync_block = async move {
             /* sync descriptor and data */
@@ -70,13 +70,6 @@ impl BlockManager {
                     .write_or_create(&data_path, SeekFrom::Current(0))
                     .await?;
                 data_block.sync_all().await?;
-            }
-
-            {
-                let mut descr_block = FILE_CACHE
-                    .write_or_create(&desc_path, SeekFrom::Current(0))
-                    .await?;
-                descr_block.sync_all().await?;
             }
 
             {
@@ -118,7 +111,6 @@ impl BlockManager {
     ///
     /// * `ReductError` - If the block is still in use or file system operation failed.
     pub async fn remove_block(&mut self, block_id: u64) -> Result<(), ReductError> {
-        self.mark_meta_clean(&block_id);
         self.wal.append(block_id, WalEntry::RemoveBlock).await?;
 
         for path in all_block_file_paths(&self.path, block_id) {
@@ -315,7 +307,9 @@ mod tests {
         let loaded_block = block_manager.load_block(block_id).await.unwrap();
         assert_eq!(loaded_block.read().await.unwrap().block_id(), block_id);
 
+        assert!(!block_manager.block_cache.read_cache_contains(&block_id));
         block_manager.finish_block(loaded_block).await.unwrap();
+        assert!(block_manager.block_cache.read_cache_contains(&block_id));
 
         let path = block_manager
             .path

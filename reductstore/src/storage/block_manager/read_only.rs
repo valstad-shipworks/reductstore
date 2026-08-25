@@ -73,7 +73,8 @@ impl BlockManager {
         })
     }
 
-    pub(in crate::storage) fn apply_replica_index_reload(&mut self, updated_index: BlockIndex) {
+    pub(in crate::storage) fn apply_replica_index_reload(&mut self, mut updated_index: BlockIndex) {
+        updated_index.adopt_size_counter(self.block_index.size_counter());
         self.block_index = updated_index;
         self.block_cache.clear();
         self.last_replica_sync = Instant::now();

@@ -10,8 +10,7 @@
 //! worker that drains them and emits `$system` events lives in
 //! `crate::syslog::aggregate::usage`.
 
-use crate::core::sync::AsyncRwLock;
-use reduct_base::error::ReductError;
+use parking_lot::Mutex;
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -20,15 +19,15 @@ use std::sync::atomic::{AtomicU64, Ordering};
 /// The instance-wide tallies are plain relaxed atomics: independent counters,
 /// no ordering between them is required. Per-bucket traffic — including each
 /// bucket's set of distinct entries written to / read from — is kept in
-/// `per_bucket` behind a single async lock so each `count_*` updates it in one
-/// critical section. `drain` resets everything, so increments that race with a
+/// `per_bucket` behind a short critical section so each `count_*` updates it
+/// atomically. `drain` resets everything, so increments that race with a
 /// flush roll into the next interval instead of being lost.
 pub(crate) struct UsageCounters {
     write_bytes: AtomicU64,
     read_bytes: AtomicU64,
     records_written: AtomicU64,
     records_read: AtomicU64,
-    per_bucket: AsyncRwLock<HashMap<String, BucketTraffic>>,
+    per_bucket: Mutex<HashMap<String, BucketTraffic>>,
 }
 
 impl Default for UsageCounters {
@@ -38,7 +37,7 @@ impl Default for UsageCounters {
             read_bytes: AtomicU64::new(0),
             records_written: AtomicU64::new(0),
             records_read: AtomicU64::new(0),
-            per_bucket: AsyncRwLock::new(HashMap::new()),
+            per_bucket: Mutex::new(HashMap::new()),
         }
     }
 }
@@ -74,48 +73,40 @@ pub(crate) struct DrainedUsage {
 }
 
 impl UsageCounters {
-    pub(crate) async fn count_write(
-        &self,
-        bucket_name: &str,
-        entry_name: &str,
-        bytes: u64,
-    ) -> Result<(), ReductError> {
+    pub(crate) fn count_write(&self, bucket_name: &str, entry_name: &str, bytes: u64) {
         self.write_bytes.fetch_add(bytes, Ordering::Relaxed);
         self.records_written.fetch_add(1, Ordering::Relaxed);
 
-        let mut buckets = self.per_bucket.write().await?;
-        let bucket = buckets.entry(bucket_name.to_string()).or_default();
+        let mut buckets = self.per_bucket.lock();
+        let bucket = Self::bucket_traffic(&mut buckets, bucket_name);
         bucket.write_bytes += bytes;
         bucket.records_written += 1;
-        bucket.written_entries.insert(entry_name.to_string());
-        Ok(())
+        if !bucket.written_entries.contains(entry_name) {
+            bucket.written_entries.insert(entry_name.to_string());
+        }
     }
 
-    pub(crate) async fn count_read(
-        &self,
-        bucket_name: &str,
-        entry_name: &str,
-        bytes: u64,
-    ) -> Result<(), ReductError> {
+    pub(crate) fn count_read(&self, bucket_name: &str, entry_name: &str, bytes: u64) {
         self.read_bytes.fetch_add(bytes, Ordering::Relaxed);
         self.records_read.fetch_add(1, Ordering::Relaxed);
 
-        let mut buckets = self.per_bucket.write().await?;
-        let bucket = buckets.entry(bucket_name.to_string()).or_default();
+        let mut buckets = self.per_bucket.lock();
+        let bucket = Self::bucket_traffic(&mut buckets, bucket_name);
         bucket.read_bytes += bytes;
         bucket.records_read += 1;
-        bucket.read_entries.insert(entry_name.to_string());
-        Ok(())
+        if !bucket.read_entries.contains(entry_name) {
+            bucket.read_entries.insert(entry_name.to_string());
+        }
     }
 
-    pub(crate) async fn drain(&self) -> Result<DrainedUsage, ReductError> {
-        let mut buckets_guard = self.per_bucket.write().await?;
-
+    pub(crate) fn drain(&self) -> DrainedUsage {
         // Draining the whole map drops every bucket; only buckets with traffic
         // in the next interval are re-inserted, so a deleted bucket cannot grow
         // the map unbounded.
-        let buckets: HashMap<String, DrainedUsageCounters> = buckets_guard
-            .drain()
+        let drained = std::mem::take(&mut *self.per_bucket.lock());
+
+        let buckets: HashMap<String, DrainedUsageCounters> = drained
+            .into_iter()
             .map(|(name, traffic)| {
                 (
                     name,
@@ -142,7 +133,17 @@ impl UsageCounters {
             read_entries: buckets.values().map(|bucket| bucket.read_entries).sum(),
         };
 
-        Ok(DrainedUsage { total, buckets })
+        DrainedUsage { total, buckets }
+    }
+
+    fn bucket_traffic<'a>(
+        buckets: &'a mut HashMap<String, BucketTraffic>,
+        bucket_name: &str,
+    ) -> &'a mut BucketTraffic {
+        if !buckets.contains_key(bucket_name) {
+            buckets.insert(bucket_name.to_string(), BucketTraffic::default());
+        }
+        buckets.get_mut(bucket_name).unwrap()
     }
 }
 
@@ -174,18 +175,12 @@ mod tests {
     #[tokio::test]
     async fn drain_returns_counts_and_resets() {
         let counters = UsageCounters::default();
-        counters
-            .count_write("bucket-1", "entry-1", 10)
-            .await
-            .unwrap();
-        counters
-            .count_write("bucket-1", "entry-1", 5)
-            .await
-            .unwrap();
-        counters.count_read("bucket-1", "entry-1", 7).await.unwrap();
+        counters.count_write("bucket-1", "entry-1", 10);
+        counters.count_write("bucket-1", "entry-1", 5);
+        counters.count_read("bucket-1", "entry-1", 7);
 
         assert_eq!(
-            counters.drain().await.unwrap().total,
+            counters.drain().total,
             DrainedUsageCounters {
                 write_bytes: 15,
                 read_bytes: 7,
@@ -196,7 +191,7 @@ mod tests {
             }
         );
         assert_eq!(
-            counters.drain().await.unwrap().total,
+            counters.drain().total,
             DrainedUsageCounters::default(),
             "drain must reset the counters"
         );
@@ -206,18 +201,12 @@ mod tests {
     #[tokio::test]
     async fn counts_after_drain_land_in_next_interval() {
         let counters = UsageCounters::default();
-        counters
-            .count_write("bucket-1", "entry-1", 10)
-            .await
-            .unwrap();
-        counters.drain().await.unwrap();
+        counters.count_write("bucket-1", "entry-1", 10);
+        counters.drain();
 
-        counters
-            .count_write("bucket-1", "entry-1", 3)
-            .await
-            .unwrap();
-        counters.count_read("bucket-1", "entry-1", 4).await.unwrap();
-        let drained = counters.drain().await.unwrap().total;
+        counters.count_write("bucket-1", "entry-1", 3);
+        counters.count_read("bucket-1", "entry-1", 4);
+        let drained = counters.drain().total;
         assert_eq!(drained.write_bytes, 3);
         assert_eq!(drained.records_written, 1);
         assert_eq!(drained.read_bytes, 4);
@@ -228,17 +217,11 @@ mod tests {
     #[tokio::test]
     async fn per_bucket_counts_isolate_by_bucket() {
         let counters = UsageCounters::default();
-        counters
-            .count_write("bucket-1", "entry-1", 10)
-            .await
-            .unwrap();
-        counters
-            .count_write("bucket-2", "entry-1", 25)
-            .await
-            .unwrap();
-        counters.count_read("bucket-2", "entry-2", 7).await.unwrap();
+        counters.count_write("bucket-1", "entry-1", 10);
+        counters.count_write("bucket-2", "entry-1", 25);
+        counters.count_read("bucket-2", "entry-2", 7);
 
-        let drained = counters.drain().await.unwrap();
+        let drained = counters.drain();
         assert_eq!(drained.total.write_bytes, 35);
 
         let b1 = drained.buckets.get("bucket-1").unwrap();
@@ -256,16 +239,13 @@ mod tests {
     #[tokio::test]
     async fn drained_buckets_are_removed_from_the_map() {
         let counters = UsageCounters::default();
-        counters
-            .count_write("bucket-1", "entry-1", 10)
-            .await
-            .unwrap();
+        counters.count_write("bucket-1", "entry-1", 10);
 
-        let drained = counters.drain().await.unwrap();
+        let drained = counters.drain();
         assert!(drained.buckets.contains_key("bucket-1"));
 
         // Nothing was written in this interval, so the bucket must be gone.
-        let drained = counters.drain().await.unwrap();
+        let drained = counters.drain();
         assert!(
             drained.buckets.is_empty(),
             "a bucket that drains to zero must be removed from the map"
@@ -278,16 +258,13 @@ mod tests {
         let counters = UsageCounters::default();
         // Same entry written five times in one interval.
         for _ in 0..5 {
-            counters
-                .count_write("bucket-1", "entry-1", 10)
-                .await
-                .unwrap();
+            counters.count_write("bucket-1", "entry-1", 10);
         }
         // Two distinct entries read.
-        counters.count_read("bucket-1", "entry-1", 4).await.unwrap();
-        counters.count_read("bucket-1", "entry-2", 4).await.unwrap();
+        counters.count_read("bucket-1", "entry-1", 4);
+        counters.count_read("bucket-1", "entry-2", 4);
 
-        let drained = counters.drain().await.unwrap();
+        let drained = counters.drain();
         assert_eq!(drained.total.records_written, 5);
         assert_eq!(
             drained.total.written_entries, 1,
@@ -305,16 +282,10 @@ mod tests {
     #[tokio::test]
     async fn distinct_written_entries_count_two_different_entries() {
         let counters = UsageCounters::default();
-        counters
-            .count_write("bucket-1", "entry-1", 10)
-            .await
-            .unwrap();
-        counters
-            .count_write("bucket-1", "entry-2", 10)
-            .await
-            .unwrap();
+        counters.count_write("bucket-1", "entry-1", 10);
+        counters.count_write("bucket-1", "entry-2", 10);
 
-        let drained = counters.drain().await.unwrap();
+        let drained = counters.drain();
         assert_eq!(drained.total.written_entries, 2);
         assert_eq!(drained.total.records_written, 2);
     }
@@ -324,24 +295,12 @@ mod tests {
     async fn distinct_entries_are_keyed_by_bucket_and_name() {
         let counters = UsageCounters::default();
         // The same entry name in two different buckets in one interval.
-        counters
-            .count_write("bucket-a", "sensor-1", 10)
-            .await
-            .unwrap();
-        counters
-            .count_write("bucket-b", "sensor-1", 10)
-            .await
-            .unwrap();
-        counters
-            .count_read("bucket-a", "sensor-1", 10)
-            .await
-            .unwrap();
-        counters
-            .count_read("bucket-b", "sensor-1", 10)
-            .await
-            .unwrap();
+        counters.count_write("bucket-a", "sensor-1", 10);
+        counters.count_write("bucket-b", "sensor-1", 10);
+        counters.count_read("bucket-a", "sensor-1", 10);
+        counters.count_read("bucket-b", "sensor-1", 10);
 
-        let drained = counters.drain().await.unwrap();
+        let drained = counters.drain();
         assert_eq!(drained.buckets.get("bucket-a").unwrap().written_entries, 1);
         assert_eq!(drained.buckets.get("bucket-b").unwrap().written_entries, 1);
         assert_eq!(drained.buckets.get("bucket-a").unwrap().read_entries, 1);

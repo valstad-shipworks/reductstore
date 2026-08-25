@@ -286,15 +286,17 @@ impl StorageEngine {
     }
 
     async fn total_usage(&self) -> Result<u64, ReductError> {
-        let buckets = self.buckets.read().await?;
-        let infos = buckets
+        let buckets = self
+            .buckets
+            .read()
+            .await?
             .values()
-            .map(|bucket| bucket.clone().info())
+            .cloned()
             .collect::<Vec<_>>();
 
         let mut usage = 0u64;
-        for task in infos {
-            usage += task.await?.info.size;
+        for bucket in buckets {
+            usage += bucket.cached_size().await?;
         }
 
         Ok(usage)
@@ -901,7 +903,7 @@ mod tests {
             .unwrap();
         writer.send(Ok(None)).await.unwrap();
 
-        let drained = storage.usage_counters().drain().await.unwrap();
+        let drained = storage.usage_counters().drain();
         assert_eq!(drained.total.write_bytes, 10);
         assert_eq!(drained.total.records_written, 1);
         assert_eq!(drained.total.records_read, 0);
@@ -917,7 +919,7 @@ mod tests {
             .await
             .unwrap();
 
-        let drained = storage.usage_counters().drain().await.unwrap();
+        let drained = storage.usage_counters().drain();
         assert_eq!(drained.total.read_bytes, 10);
         assert_eq!(drained.total.records_read, 1);
         assert_eq!(drained.total.records_written, 0);

@@ -14,6 +14,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Add `RS_ZENOH_BUCKET_MAX_BLOCK_RECORDS` (default 65536) so the auto-created Zenoh bucket rolls blocks far less often under high-rate ingest, and raise the default Zenoh ingest worker cap from 8 to 16 (`RS_ZENOH_INGEST_WORKERS` overrides); for maximum ingest rate on macOS consider `RS_FS_SYNC_INTERVAL_MS`
+- Add an opt-in benchmark API under `/api/v1/benchmark` (`RS_BENCHMARK_API=true`; `RS_BENCHMARK_MAX_TOTAL_SIZE`, `RS_BENCHMARK_MAX_RECORDS`, `RS_BENCHMARK_MAX_CONCURRENCY`, `RS_BENCHMARK_MAX_DURATION` cap requests) with raw disk, engine ingest, and read/query benchmarks
+- Add `RS_FS_FREE_SPACE_CHECK_INTERVAL_MS` to reuse the last free-space sample between writes instead of calling `statvfs` for every record
 - Expose the effective instance name and role in the `/api/v1/info` response, [PR-1569](https://github.com/reductstore/reductstore/pull/1569) by @lntutor
 - Automatically create missing destination buckets during replication, [PR-1539](https://github.com/reductstore/reductstore/pull/1539) by @rohankumardubey
 - Add a replication `compression` setting (`none`, `zstd`, `gzip`, default `none`) that compresses batch payloads during transfer using HTTP `Content-Encoding`, [Issue-1348](https://github.com/reductstore/reductstore/issues/1348) by @DibbayajyotiRoy
@@ -39,6 +42,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Fix a deadlock when several clients write concurrently to the same entry
+- Reduce per-record write overhead: single-syscall WAL appends, no block copies into the block index, cached entry sizes for quota checks, and lock-free usage counters
 - Avoid blocking `$system` event replication notifications while a replication task is being created, updated, or has its mode changed, by using shared outer replication repository access for those operations instead of exclusive access, the same pattern already used for removal, [PR-1594](https://github.com/reductstore/reductstore/pull/1594) by @vjymisal0
 - Avoid a lock inversion when deleting a replication task that emits final `$system` diagnostics by using shared outer replication repository access for removal and transaction notifications, [PR-1572](https://github.com/reductstore/reductstore/pull/1572)
 - Replicate internal `$system` events when `$system` is a replication source by notifying replication from the system-event writer; to prevent feedback loops, diagnostics of a `$system`-source replication and log messages from the replication module are excluded, [PR-1567](https://github.com/reductstore/reductstore/pull/1567) by @DibbayajyotiRoy

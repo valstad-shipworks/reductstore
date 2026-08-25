@@ -2,7 +2,6 @@
 // Licensed under the Apache License, Version 2.0
 
 use async_trait::async_trait;
-use std::collections::hash_map::Entry::{Occupied, Vacant};
 use std::collections::{BTreeSet, HashMap};
 use std::io::{ErrorKind, Read, Seek, SeekFrom, Write};
 use std::mem;
@@ -15,9 +14,10 @@ use prost::Message;
 use reduct_base::error::ReductError;
 use reduct_base::internal_server_error;
 
+use crate::backend::file::File;
 use crate::core::file_cache::FILE_CACHE;
 use crate::storage::proto::Record;
-use byteorder::{BigEndian, ReadBytesExt, WriteBytesExt};
+use byteorder::{BigEndian, ReadBytesExt};
 
 const WAL_FILE_SIZE: u64 = 1_000_000;
 const WAL_DIR: &str = ".wal";
@@ -188,42 +188,42 @@ const STOP_MARKER: u8 = 255;
 impl Wal for WalImpl {
     async fn append(&mut self, block_id: u64, entry: WalEntry) -> Result<(), ReductError> {
         let path = self.block_wal_path(block_id);
-        let mut file = if !FILE_CACHE.try_exists(&path).await? {
-            let mut file = FILE_CACHE
-                .write_or_create(&path, SeekFrom::Current(0))
-                .await?;
-            file.set_len(WAL_FILE_SIZE)?;
-            self.file_positions.insert(block_id, 0);
-            file
-        } else {
-            let pos = match self.file_positions.entry(block_id) {
-                Occupied(e) => e.get().clone(),
-                Vacant(e) => {
+        let (mut file, start) = match self.file_positions.get(&block_id) {
+            Some(&pos) => {
+                let file = FILE_CACHE
+                    .write_or_create(&path, SeekFrom::Current(0))
+                    .await?;
+                (file, pos.saturating_sub(1))
+            }
+            None => {
+                let exists = FILE_CACHE.try_exists(&path).await?;
+                let mut file = FILE_CACHE
+                    .write_or_create(&path, SeekFrom::Current(0))
+                    .await?;
+                if exists {
                     warn!(
                         "File position for block {} not found. Overwrite WAL",
                         block_id
                     );
-                    e.insert(0).clone()
+                } else {
+                    file.set_len(WAL_FILE_SIZE)?;
                 }
-            };
-
-            FILE_CACHE
-                .write_or_create(&path, SeekFrom::Start(pos))
-                .await?
+                (file, 0)
+            }
         };
 
-        if file.stream_position()? > 0 {
-            file.seek(SeekFrom::Current(-1))?;
-        }
-
-        let buf = entry.encode();
-        file.write_all(&buf)?;
+        let mut buf = entry.encode();
         let mut crc = Digest::new();
         crc.write(&buf);
-        file.write(&crc.sum64().to_be_bytes())?;
-        file.write_u8(STOP_MARKER)?;
+        buf.extend_from_slice(&crc.sum64().to_be_bytes());
+        buf.push(STOP_MARKER);
+        File::run_blocking_io(|| {
+            file.seek(SeekFrom::Start(start))?;
+            file.write_all(&buf)
+        })?;
+
         self.file_positions
-            .insert(block_id, file.stream_position()?);
+            .insert(block_id, start + buf.len() as u64);
         self.known_blocks.insert(block_id);
         Ok(())
     }
@@ -267,11 +267,14 @@ impl Wal for WalImpl {
     }
 
     async fn remove(&mut self, block_id: u64) -> Result<(), ReductError> {
-        let path = self.block_wal_path(block_id);
-        if FILE_CACHE.try_exists(&path).await? {
-            FILE_CACHE.remove(&path).await?;
+        if self.known_blocks.contains(&block_id) {
+            let path = self.block_wal_path(block_id);
+            if FILE_CACHE.try_exists(&path).await? {
+                FILE_CACHE.remove(&path).await?;
+            }
         }
         self.known_blocks.remove(&block_id);
+        self.file_positions.remove(&block_id);
         Ok(())
     }
 
@@ -320,9 +323,12 @@ pub(in crate::storage) async fn create_wal(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::sync::{reset_rwlock_config, set_rwlock_timeout};
     use reduct_base::error::ErrorCode;
     use rstest::*;
+    use serial_test::serial;
     use std::fs::OpenOptions;
+    use std::time::Duration;
 
     #[rstest]
     #[tokio::test]
@@ -481,6 +487,94 @@ mod tests {
 
         let err = WalImpl::try_build(wal_path).await.err().unwrap();
         assert_eq!(err.status, ErrorCode::InternalServerError);
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn test_position_tracks_stream_after_append(#[future] wal: WalImpl) {
+        let mut wal = wal.await;
+        for _ in 0..3 {
+            wal.append(1, WalEntry::WriteRecord(Record::default()))
+                .await
+                .unwrap();
+            assert_eq!(wal.file_positions[&1], stream_position(&wal, 1).await);
+        }
+        assert_eq!(wal.read(1).await.unwrap().len(), 3);
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn test_append_after_remove_starts_fresh(#[future] wal: WalImpl) {
+        let mut wal = wal.await;
+        wal.append(1, WalEntry::WriteRecord(Record::default()))
+            .await
+            .unwrap();
+        wal.append(1, WalEntry::RemoveRecord(7)).await.unwrap();
+        wal.remove(1).await.unwrap();
+        assert!(!wal.file_positions.contains_key(&1));
+
+        wal.append(1, WalEntry::UpdateRecord(Record::default()))
+            .await
+            .unwrap();
+        assert_eq!(wal.file_positions[&1], stream_position(&wal, 1).await);
+        assert_eq!(
+            wal.read(1).await.unwrap(),
+            vec![WalEntry::UpdateRecord(Record::default())]
+        );
+        assert_eq!(wal.list().await.unwrap(), vec![1]);
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn test_append_to_listed_block_after_restart(#[future] wal: WalImpl) {
+        let mut wal = wal.await;
+        wal.append(1, WalEntry::WriteRecord(Record::default()))
+            .await
+            .unwrap();
+
+        let mut wal = WalImpl::try_build(wal.root_path.clone()).await.unwrap();
+        assert_eq!(wal.list().await.unwrap(), vec![1]);
+        assert!(wal.file_positions.is_empty());
+
+        wal.append(1, WalEntry::RemoveBlock).await.unwrap();
+        assert_eq!(wal.file_positions[&1], stream_position(&wal, 1).await);
+        assert_eq!(wal.read(1).await.unwrap(), vec![WalEntry::RemoveBlock]);
+    }
+
+    #[rstest]
+    #[serial]
+    #[tokio::test]
+    async fn test_remove_retries_after_failed_file_removal(#[future] wal: WalImpl) {
+        let mut wal = wal.await;
+        wal.append(1, WalEntry::WriteRecord(Record::default()))
+            .await
+            .unwrap();
+        let position = stream_position(&wal, 1).await;
+
+        let guard = FILE_CACHE
+            .write_or_create(&wal.block_wal_path(1), SeekFrom::Current(0))
+            .await
+            .unwrap();
+        set_rwlock_timeout(Duration::from_millis(50));
+        let err = wal.remove(1).await.err().unwrap();
+        reset_rwlock_config();
+        assert_eq!(err.status, ErrorCode::InternalServerError);
+        assert_eq!(wal.list().await.unwrap(), vec![1]);
+        assert_eq!(wal.file_positions.get(&1), Some(&position));
+        drop(guard);
+
+        wal.remove(1).await.unwrap();
+        assert!(wal.list().await.unwrap().is_empty());
+        assert!(!wal.block_wal_path(1).exists());
+    }
+
+    async fn stream_position(wal: &WalImpl, block_id: u64) -> u64 {
+        FILE_CACHE
+            .write_or_create(&wal.block_wal_path(block_id), SeekFrom::Current(0))
+            .await
+            .unwrap()
+            .stream_position()
+            .unwrap()
     }
 
     #[fixture]

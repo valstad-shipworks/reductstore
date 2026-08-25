@@ -1,6 +1,7 @@
 // Copyright 2021-2026 ReductSoftware UG
 // Licensed under the Apache License, Version 2.0
 
+use super::quotas::FreeSpaceCache;
 use super::{
     default_free_space_fn, normalize_entry_name, settings_for_entry, Bucket, FreeSpaceFn,
     MultiEntryQuery,
@@ -113,6 +114,7 @@ impl BucketBuilder {
             io_limiter,
             usage_counters,
             free_space_fn: self.free_space_fn.unwrap_or_else(default_free_space_fn),
+            free_space_cache: FreeSpaceCache::default(),
         };
 
         bucket.save_settings().await?;
@@ -195,6 +197,7 @@ impl BucketBuilder {
             io_limiter,
             usage_counters,
             free_space_fn: self.free_space_fn.unwrap_or_else(default_free_space_fn),
+            free_space_cache: FreeSpaceCache::default(),
         })
     }
 }

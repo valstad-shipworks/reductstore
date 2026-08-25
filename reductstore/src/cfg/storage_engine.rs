@@ -12,6 +12,7 @@ pub struct StorageEngineConfig {
     pub replica_update_interval: Duration,
     pub enable_integrity_checks: bool,
     pub max_storage_size: Option<u64>,
+    pub free_space_check_interval: Duration,
 }
 
 const DEFAULT_COMPACTION_INTERVAL_SECS: u64 = 60;
@@ -24,6 +25,7 @@ impl Default for StorageEngineConfig {
             replica_update_interval: Duration::from_secs(DEFAULT_REPLICA_UPDATE_INTERVAL_SECS),
             enable_integrity_checks: true,
             max_storage_size: None,
+            free_space_check_interval: Duration::ZERO,
         }
     }
 }
@@ -45,6 +47,10 @@ impl<EnvGetter: GetEnv, ExtCfg: ExtCfgBounds> CfgParser<EnvGetter, ExtCfg> {
             max_storage_size: env
                 .get_optional::<ByteSize>("RS_ENGINE_MAX_STORAGE_SIZE")
                 .map(|size| size.as_u64()),
+            free_space_check_interval: Duration::from_millis(
+                env.get_optional::<u64>("RS_FS_FREE_SPACE_CHECK_INTERVAL_MS")
+                    .unwrap_or(0),
+            ),
         }
     }
 }
@@ -77,12 +83,17 @@ mod tests {
             .expect_get()
             .with(eq("RS_ENGINE_MAX_STORAGE_SIZE"))
             .return_const(Ok("10GB".to_string()));
+        env_getter
+            .expect_get()
+            .with(eq("RS_FS_FREE_SPACE_CHECK_INTERVAL_MS"))
+            .return_const(Ok("250".to_string()));
 
         let expected = StorageEngineConfig {
             compaction_interval: Duration::from_secs(120),
             replica_update_interval: Duration::from_secs(45),
             enable_integrity_checks: false,
             max_storage_size: Some(10_000_000_000),
+            free_space_check_interval: Duration::from_millis(250),
         };
 
         assert_eq!(

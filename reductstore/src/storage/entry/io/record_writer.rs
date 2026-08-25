@@ -59,10 +59,10 @@ impl RecordWriter {
     ) -> Result<Self, ReductError> {
         let (file_path, offset, bucket_name, entry_name, usage_counters) = {
             let mut bm = block_manager.write().await?;
-            let block = block_ref.read().await?;
 
             let (file_path, offset) = {
-                bm.index_mut().insert_or_update(block.to_owned());
+                let block = block_ref.read().await?;
+                bm.index_mut().insert_or_update(&*block);
                 bm.begin_write_record(&block, time)?
             };
 
@@ -77,15 +77,13 @@ impl RecordWriter {
             )
         };
 
-        let block = block_ref.read().await?;
-        let block_id = block.block_id();
-        let record_index = block.get_record(time).unwrap();
-        let content_size = record_index.end - record_index.begin;
+        let (block_id, content_size) = {
+            let block = block_ref.read().await?;
+            let record_index = block.get_record(time).unwrap();
+            (block.block_id(), record_index.end - record_index.begin)
+        };
 
-        // Count the write at record creation, mirroring `RecordReader`.
-        usage_counters
-            .count_write(&bucket_name, &entry_name, content_size)
-            .await?;
+        usage_counters.count_write(&bucket_name, &entry_name, content_size);
 
         let ctx = WriteContext {
             bucket_name,

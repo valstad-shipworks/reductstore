@@ -270,7 +270,7 @@ impl BlockManager {
             .append(block_id, WalEntry::WriteRecord(wal_record))
             .await?;
 
-        self.defer_meta_save(block_ref).await?;
+        self.save_block(block_ref).await?;
 
         debug!(
             "Finished writing record {} to block {}/{}/{}.meta with state {:?}",
@@ -327,48 +327,6 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::Arc;
     use std::time::Duration;
-
-    #[rstest]
-    #[tokio::test]
-    async fn test_finish_defers_descriptor_write(
-        #[future] block_manager: BlockManager,
-        block_id: u64,
-    ) {
-        let mut block_manager = block_manager.await;
-        let block = block_manager.load_block(block_id).await.unwrap();
-
-        // A fresh record beyond the one the fixture already persisted.
-        block
-            .write()
-            .await
-            .unwrap()
-            .insert_or_update_record(Record {
-                timestamp: Some(us_to_ts(&2)),
-                state: 0,
-                ..Default::default()
-            });
-        block_manager
-            .finish_write_record(block_id, record::State::Finished, 2)
-            .await
-            .unwrap();
-
-        assert_eq!(block_manager.wal.list().await.unwrap(), vec![block_id]);
-        assert!(!block_manager.dirty_meta.is_empty());
-        let desc_path = block_manager.path_to_desc(block_id);
-        let on_disk = BlockProto::decode(std::fs::read(&desc_path).unwrap().as_slice()).unwrap();
-        assert_eq!(on_disk.records.len(), 1, "descriptor write is deferred");
-
-        block_manager.flush_dirty_meta().await.unwrap();
-        assert!(block_manager.dirty_meta.is_empty());
-        assert!(block_manager.wal.list().await.unwrap().is_empty());
-        let on_disk = BlockProto::decode(std::fs::read(&desc_path).unwrap().as_slice()).unwrap();
-        let flushed = on_disk
-            .records
-            .iter()
-            .find(|r| ts_to_us(r.timestamp.as_ref().unwrap()) == 2)
-            .expect("flush persisted the deferred record");
-        assert_eq!(flushed.state, 1);
-    }
 
     #[rstest]
     #[tokio::test]

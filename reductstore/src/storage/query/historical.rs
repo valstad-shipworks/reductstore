@@ -427,6 +427,8 @@ mod tests {
             .unwrap(),
         ));
 
+        block_manager.write().await.unwrap().clear_cache_for_test();
+
         let mut query = build_query(0, 1001, QueryOptions::default()).unwrap();
         let records = read_to_vector(&mut query, block_manager).await;
 
@@ -549,6 +551,7 @@ mod tests {
         // Simulate stale in-memory CRC while index on disk is already updated.
         {
             let mut bm = replica_block_manager.write().await.unwrap();
+            bm.clear_cache_for_test();
             bm.index_mut()
                 .insert_or_update_with_crc(Block::new(1000), 1);
         }

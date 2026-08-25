@@ -118,13 +118,7 @@ impl UsageEventAggregator {
     ) {
         let duration = last_flush.elapsed().as_secs_f64();
         *last_flush = Instant::now();
-        let drained = match counters.drain().await {
-            Ok(drained) => drained,
-            Err(err) => {
-                error!("Failed to drain usage counters: {}", err);
-                return;
-            }
-        };
+        let drained = counters.drain();
 
         let (snapshot, bucket_snapshots) = match storage.usage_snapshot().await {
             Ok(snapshots) => snapshots,

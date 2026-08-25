@@ -1,5 +1,6 @@
 // Copyright 2021-2026 ReductSoftware UG
 // Licensed under the Apache License, Version 2.0
+pub mod benchmark_api;
 pub mod bucket_api;
 pub mod diagnostics;
 pub mod entry_api;

@@ -8,6 +8,7 @@ use crate::storage::block_manager::{
     BlockManager, COMPRESSED_DATA_FILE_EXT, COMPRESSED_DESCRIPTOR_FILE_EXT,
 };
 use crate::storage::engine::MAX_IO_BUFFER_SIZE;
+use crate::storage::proto::block_index::Block as BlockEntry;
 use crate::storage::proto::block_index::CompressionAlgorithm as ProtoCompressionAlgorithm;
 use crate::storage::proto::Block as BlockProto;
 use crc64fast::Digest;
@@ -86,28 +87,16 @@ impl BlockManager {
             CompressionAlgorithm::None => return Ok(()),
             CompressionAlgorithm::Zstd => {
                 let (data_size, desc_size) = self.compress_block_zstd(block_id).await?;
-                let block = self.block_index.get_block_mut(block_id).ok_or_else(|| {
-                    not_found!(
-                        "Block {} not found in entry {}/{}",
-                        block_id,
-                        self.bucket,
-                        self.entry
-                    )
+                self.update_index_block(block_id, |block| {
+                    block.size = data_size;
+                    block.metadata_size = desc_size;
                 })?;
-                block.size = data_size;
-                block.metadata_size = desc_size;
             }
         }
 
-        let block = self.block_index.get_block_mut(block_id).ok_or_else(|| {
-            not_found!(
-                "Block {} not found in entry {}/{}",
-                block_id,
-                self.bucket,
-                self.entry
-            )
+        self.update_index_block(block_id, |block| {
+            block.compression = Some(i32::from(algorithm));
         })?;
-        block.compression = Some(i32::from(algorithm));
         self.block_index.save().await?;
         self.block_index.sync_all().await?;
 
@@ -177,20 +166,14 @@ impl BlockManager {
             internal_server_error!("Failed to decode descriptor file {:?}: {}", desc_path, err)
         })?;
 
-        let block = self.block_index.get_block_mut(block_id).ok_or_else(|| {
-            not_found!(
-                "Block {} not found in entry {}/{}",
-                block_id,
-                self.bucket,
-                self.entry
-            )
+        self.update_index_block(block_id, |block| {
+            block.compression = None;
+            block.size = data_size;
+            block.metadata_size = desc_size;
+            block.crc64 = Some(crc.sum64());
+            block.version = desc_proto.version;
+            block.corrupted = desc_proto.corrupted;
         })?;
-        block.compression = None;
-        block.size = data_size;
-        block.metadata_size = desc_size;
-        block.crc64 = Some(crc.sum64());
-        block.version = desc_proto.version;
-        block.corrupted = desc_proto.corrupted;
         self.block_index.save().await?;
 
         self.decompress_cache.invalidate(&self.path, block_id).await;
@@ -296,6 +279,23 @@ impl BlockManager {
             .len();
 
         Ok((compressed_data_size, compressed_desc_size))
+    }
+
+    fn update_index_block(
+        &mut self,
+        block_id: u64,
+        update: impl FnOnce(&mut BlockEntry),
+    ) -> Result<(), ReductError> {
+        if self.block_index.update_block(block_id, update) {
+            Ok(())
+        } else {
+            Err(not_found!(
+                "Block {} not found in entry {}/{}",
+                block_id,
+                self.bucket,
+                self.entry
+            ))
+        }
     }
 }
 
@@ -459,11 +459,9 @@ mod tests {
     async fn test_compress_block_already_compressed() {
         let (mut block_manager, block_id, _, _) =
             block_manager_with_data(b"already compressed".to_vec()).await;
-        block_manager
-            .index_mut()
-            .get_block_mut(block_id)
-            .unwrap()
-            .compression = Some(i32::from(CompressionAlgorithm::Zstd));
+        block_manager.index_mut().update_block(block_id, |block| {
+            block.compression = Some(i32::from(CompressionAlgorithm::Zstd));
+        });
 
         let err = block_manager
             .compress_block(block_id, CompressionAlgorithm::Zstd)
@@ -567,11 +565,9 @@ mod tests {
     async fn test_compress_block_uses_data_file_size() {
         let (mut block_manager, block_id, original_data, _) =
             block_manager_with_data(b"short data".to_vec()).await;
-        block_manager
-            .index_mut()
-            .get_block_mut(block_id)
-            .unwrap()
-            .size = original_data.len() as u64 + 1;
+        block_manager.index_mut().update_block(block_id, |block| {
+            block.size = original_data.len() as u64 + 1;
+        });
 
         block_manager
             .compress_block(block_id, CompressionAlgorithm::Zstd)

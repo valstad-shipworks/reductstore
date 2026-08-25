@@ -1,6 +1,7 @@
 // Copyright 2021-2026 ReductSoftware UG
 // Licensed under the Apache License, Version 2.0
 //
+mod benchmark;
 mod bucket;
 mod entry;
 mod io;
@@ -224,38 +225,51 @@ impl AxumAppBuilder {
                 .expect("Components must be set before building the app"),
         ));
 
+        let mut router = Router::new()
+            // Server API
+            .nest(
+                &format!("{}api/v1", cfg.api_base_path),
+                create_server_api_routes(),
+            )
+            // Token API
+            .nest(
+                &format!("{}api/v1/tokens", cfg.api_base_path),
+                create_token_api_routes(),
+            )
+            // Bucket API + Entry API
+            .nest(&format!("{}api/v1/b", cfg.api_base_path), b_route)
+            // Replication API
+            .nest(
+                &format!("{}api/v1/replications", cfg.api_base_path),
+                create_replication_api_routes(),
+            )
+            // Lifecycle API
+            .nest(
+                &format!("{}api/v1/lifecycles", cfg.api_base_path),
+                create_lifecycle_policy_api_routes(),
+            )
+            .nest(
+                &format!("{}api/v1/io", cfg.api_base_path),
+                create_io_api_routes(),
+            )
+            .nest(
+                &format!("{}api/v1/links", cfg.api_base_path),
+                links::create_query_link_api_routes(),
+            );
+
+        if cfg.benchmark_api.enabled {
+            warn!(
+                "Benchmark API is enabled at {}api/v1/benchmark: it writes synthetic data under the data path and must not be exposed in production",
+                cfg.api_base_path
+            );
+            router = router.nest(
+                &format!("{}api/v1/benchmark", cfg.api_base_path),
+                benchmark::create_benchmark_api_routes(),
+            );
+        }
+
         (
-            Router::new()
-                // Server API
-                .nest(
-                    &format!("{}api/v1", cfg.api_base_path),
-                    create_server_api_routes(),
-                )
-                // Token API
-                .nest(
-                    &format!("{}api/v1/tokens", cfg.api_base_path),
-                    create_token_api_routes(),
-                )
-                // Bucket API + Entry API
-                .nest(&format!("{}api/v1/b", cfg.api_base_path), b_route)
-                // Replication API
-                .nest(
-                    &format!("{}api/v1/replications", cfg.api_base_path),
-                    create_replication_api_routes(),
-                )
-                // Lifecycle API
-                .nest(
-                    &format!("{}api/v1/lifecycles", cfg.api_base_path),
-                    create_lifecycle_policy_api_routes(),
-                )
-                .nest(
-                    &format!("{}api/v1/io", cfg.api_base_path),
-                    create_io_api_routes(),
-                )
-                .nest(
-                    &format!("{}api/v1/links", cfg.api_base_path),
-                    links::create_query_link_api_routes(),
-                )
+            router
                 // UI
                 .route(&format!("{}", cfg.api_base_path), get(redirect_to_index))
                 .fallback(get(show_ui))
@@ -532,6 +546,115 @@ pub(crate) mod tests {
 
             assert_eq!(response.status(), StatusCode::FOUND);
             assert_eq!(response.headers().get("location").unwrap(), "/ui/");
+        }
+
+        async fn build_app(cfg: Cfg) -> Router {
+            let (tx, rx) = tokio::sync::mpsc::channel(1);
+            tx.send(test_components(cfg.clone()).await).await.unwrap();
+            let (app, _state_keeper) = AxumAppBuilder::new()
+                .with_cfg(cfg)
+                .with_lock_file(Arc::new(LockFileBuilder::noop()))
+                .with_component_receiver(rx)
+                .build();
+            app
+        }
+
+        fn benchmark_cfg(enabled: bool, api_base_path: &str) -> Cfg {
+            let mut cfg = Cfg {
+                data_path: tempfile::tempdir().unwrap().keep(),
+                api_token: crate::cfg::ApiToken::Provisioned("init-token".to_string()),
+                api_base_path: api_base_path.to_string(),
+                ..Cfg::default()
+            };
+            cfg.benchmark_api.enabled = enabled;
+            cfg
+        }
+
+        #[tokio::test]
+        async fn test_benchmark_routes_absent_when_disabled() {
+            let app = build_app(benchmark_cfg(false, "/")).await;
+            let response = app
+                .oneshot(
+                    Request::get("/api/v1/benchmark")
+                        .header("Authorization", "Bearer init-token")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        }
+
+        #[tokio::test]
+        async fn test_benchmark_routes_present_when_enabled() {
+            let app = build_app(benchmark_cfg(true, "/")).await;
+
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::get("/api/v1/benchmark")
+                        .header("Authorization", "Bearer init-token")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let list: reduct_base::msg::benchmark_api::BenchmarkList =
+                serde_json::from_slice(&body).unwrap();
+            assert_eq!(list.benchmarks.len(), 3);
+
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::get("/api/v1/benchmark/status")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+            let response = app
+                .oneshot(
+                    Request::post("/api/v1/benchmark/disk")
+                        .header("Authorization", "Bearer init-token")
+                        .body(Body::from(r#"{"block_size": 3}"#))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        }
+
+        #[tokio::test]
+        async fn test_benchmark_routes_respect_api_base_path() {
+            let app = build_app(benchmark_cfg(true, "/prefix/")).await;
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::get("/prefix/api/v1/benchmark")
+                        .header("Authorization", "Bearer init-token")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+
+            let response = app
+                .oneshot(
+                    Request::get("/api/v1/benchmark")
+                        .header("Authorization", "Bearer init-token")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::NOT_FOUND);
         }
     }
 
@@ -936,6 +1059,12 @@ pub(crate) mod tests {
         let (tx, rx) = tokio::sync::mpsc::channel(1);
         tx.send(components).await.unwrap();
 
+        Arc::new(StateKeeper::new(Arc::new(LockFileBuilder::noop()), rx))
+    }
+
+    pub(crate) async fn keeper_with_cfg(cfg: Cfg) -> Arc<StateKeeper> {
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        tx.send(test_components(cfg).await).await.unwrap();
         Arc::new(StateKeeper::new(Arc::new(LockFileBuilder::noop()), rx))
     }
 

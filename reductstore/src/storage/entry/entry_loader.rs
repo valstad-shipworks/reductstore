@@ -308,18 +308,21 @@ impl EntryLoader {
                     .await?
                     .metadata()?
                     .len();
-                let index_block = block_index.get_block_mut(block_id).unwrap();
-                index_block.compression = Some(i32::from(CompressionAlgorithm::Zstd));
-                index_block.size = data_size;
-                index_block.metadata_size = metadata_size;
+                block_index.update_block(block_id, |index_block| {
+                    index_block.compression = Some(i32::from(CompressionAlgorithm::Zstd));
+                    index_block.size = data_size;
+                    index_block.metadata_size = metadata_size;
+                });
             }
         }
 
         block_index.save().await?;
+        let size_counter = block_index.size_counter();
         Ok(Entry {
             name: entry_name.clone(),
             bucket_name: bucket_name.clone(),
             settings: AsyncRwLock::new(options),
+            size_counter,
             block_manager: Arc::new(AsyncRwLock::new(
                 BlockManager::build(
                     path.clone(),
@@ -352,10 +355,12 @@ impl EntryLoader {
     ) -> Result<Entry, ReductError> {
         let block_index = BlockIndex::try_load(path.join(BLOCK_INDEX_FILE)).await?;
 
+        let size_counter = block_index.size_counter();
         Ok(Entry {
             name: entry_name.clone(),
             bucket_name: bucket_name.clone(),
             settings: AsyncRwLock::new(options),
+            size_counter,
             block_manager: Arc::new(AsyncRwLock::new(
                 BlockManager::build(
                     path.clone(),

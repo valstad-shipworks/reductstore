@@ -7,6 +7,7 @@ use std::fmt::{Display, Formatter};
 use std::str::FromStr;
 
 const DEFAULT_BUCKET: &str = "zenoh";
+const DEFAULT_BUCKET_MAX_BLOCK_RECORDS: u64 = 65536;
 
 /// Configuration for the minimal Zenoh API integration (single-bucket mode).
 ///
@@ -16,6 +17,8 @@ const DEFAULT_BUCKET: &str = "zenoh";
 /// - `RS_ZENOH_CONFIG`: Inline Zenoh config string (e.g., "mode=client;peer=localhost:7447")
 /// - `RS_ZENOH_CONFIG_PATH`: Path to a Zenoh JSON5 config file
 /// - `RS_ZENOH_BUCKET`: The single bucket for all Zenoh data (default: "zenoh")
+/// - `RS_ZENOH_BUCKET_MAX_BLOCK_RECORDS`: `max_block_records` applied when the bucket is auto-created (default: 65536).
+///   Existing buckets are left untouched; `RS_DEFAULTS_BUCKET_MAX_BLOCK_RECORDS` changes the default for all buckets instead.
 /// - `RS_ZENOH_SUB_KEYEXPRS`: Key expression for subscriber (write path), e.g., "**"
 /// - `RS_ZENOH_QUERY_KEYEXPRS`: Key expression for queryable (read path), e.g., "**"
 /// - `RS_ZENOH_QUERY_LOCALITY`: Allowed origin for query replies. One of `SessionLocal`, `Remote`, or `Any` (default)
@@ -42,6 +45,8 @@ pub struct ZenohApiConfig {
     pub config_path: Option<String>,
     /// The single ReductStore bucket used for all Zenoh data.
     pub bucket: String,
+    /// `max_block_records` used when the Zenoh bucket is created by the runtime.
+    pub max_block_records: Option<u64>,
     /// Key expression for the Zenoh subscriber (write path).
     /// If unset, the write path is disabled.
     pub sub_keyexprs: Option<String>,
@@ -71,6 +76,7 @@ impl Default for ZenohApiConfig {
             config_inline: None,
             config_path: None,
             bucket: DEFAULT_BUCKET.to_string(),
+            max_block_records: Some(DEFAULT_BUCKET_MAX_BLOCK_RECORDS),
             sub_keyexprs: None,
             query_keyexprs: None,
             query_locality: ZenohQueryableLocality::default(),
@@ -123,9 +129,12 @@ impl Display for ZenohApiConfig {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "enabled={}, bucket={}, config={}, config_path={}, sub_keyexprs={}, query_keyexprs={}, query_locality={}, tls={}, auth={}",
+            "enabled={}, bucket={}, max_block_records={}, config={}, config_path={}, sub_keyexprs={}, query_keyexprs={}, query_locality={}, tls={}, auth={}",
             self.enabled,
             self.bucket,
+            self.max_block_records
+                .map(|n| n.to_string())
+                .unwrap_or_else(|| "<default>".to_string()),
             self.config_inline.as_deref().unwrap_or("<none>"),
             self.config_path.as_deref().unwrap_or("<none>"),
             self.sub_keyexprs.as_deref().unwrap_or("<disabled>"),
@@ -147,6 +156,10 @@ impl<EnvGetter: GetEnv, ExtCfg: ExtCfgBounds> CfgParser<EnvGetter, ExtCfg> {
                 .get_optional("RS_ZENOH_BUCKET")
                 .filter(|value: &String| !value.trim().is_empty())
                 .unwrap_or_else(|| DEFAULT_BUCKET.to_string()),
+            max_block_records: env
+                .get_optional::<u64>("RS_ZENOH_BUCKET_MAX_BLOCK_RECORDS")
+                .filter(|n| *n > 0)
+                .or(Some(DEFAULT_BUCKET_MAX_BLOCK_RECORDS)),
             sub_keyexprs: parse_optional_string(
                 env.get_optional::<String>("RS_ZENOH_SUB_KEYEXPRS"),
             ),
@@ -214,6 +227,11 @@ mod tests {
             .return_const(Ok("telemetry".to_string()));
         env_getter
             .expect_get()
+            .with(eq("RS_ZENOH_BUCKET_MAX_BLOCK_RECORDS"))
+            .times(1)
+            .return_const(Ok("100000".to_string()));
+        env_getter
+            .expect_get()
             .with(eq("RS_ZENOH_SUB_KEYEXPRS"))
             .times(1)
             .return_const(Ok("**".to_string()));
@@ -256,6 +274,7 @@ mod tests {
         );
         assert_eq!(cfg.config_path, None);
         assert_eq!(cfg.bucket, "telemetry");
+        assert_eq!(cfg.max_block_records, Some(100000));
         assert_eq!(cfg.sub_keyexprs, Some("**".to_string()));
         assert_eq!(cfg.query_keyexprs, Some("factory/**".to_string()));
         assert_eq!(cfg.query_locality, ZenohQueryableLocality::Remote);
@@ -282,6 +301,11 @@ mod tests {
         env_getter
             .expect_get()
             .with(eq("RS_ZENOH_BUCKET"))
+            .times(1)
+            .return_const(Err(VarError::NotPresent));
+        env_getter
+            .expect_get()
+            .with(eq("RS_ZENOH_BUCKET_MAX_BLOCK_RECORDS"))
             .times(1)
             .return_const(Err(VarError::NotPresent));
         env_getter
@@ -345,6 +369,10 @@ mod tests {
         assert_eq!(cfg.config_inline, None);
         assert_eq!(cfg.config_path, None);
         assert_eq!(cfg.bucket, DEFAULT_BUCKET);
+        assert_eq!(
+            cfg.max_block_records,
+            Some(DEFAULT_BUCKET_MAX_BLOCK_RECORDS)
+        );
         assert_eq!(cfg.sub_keyexprs, None);
         assert_eq!(cfg.query_keyexprs, None);
         assert_eq!(cfg.query_locality, ZenohQueryableLocality::default());
@@ -364,6 +392,28 @@ mod tests {
 
         let cfg = CfgParser::<MockEnvGetter>::parse_zenoh_api_config(&mut Env::new(env_getter));
         assert!(!cfg.enabled);
+    }
+
+    #[rstest]
+    #[case("0")]
+    #[case("-5")]
+    #[case("lots")]
+    fn parses_invalid_max_block_records_falls_back_to_default(#[case] raw: &str) {
+        let mut env_getter = MockEnvGetter::new();
+        env_getter
+            .expect_get()
+            .with(eq("RS_ZENOH_BUCKET_MAX_BLOCK_RECORDS"))
+            .times(1)
+            .return_const(Ok(raw.to_string()));
+        env_getter
+            .expect_get()
+            .return_const(Err(VarError::NotPresent));
+
+        let cfg = CfgParser::<MockEnvGetter>::parse_zenoh_api_config(&mut Env::new(env_getter));
+        assert_eq!(
+            cfg.max_block_records,
+            Some(DEFAULT_BUCKET_MAX_BLOCK_RECORDS)
+        );
     }
 
     #[rstest]
@@ -389,6 +439,11 @@ mod tests {
             .with(eq("RS_ZENOH_BUCKET"))
             .times(1)
             .return_const(Ok("   ".to_string())); // whitespace-only
+        env_getter
+            .expect_get()
+            .with(eq("RS_ZENOH_BUCKET_MAX_BLOCK_RECORDS"))
+            .times(1)
+            .return_const(Err(VarError::NotPresent));
         env_getter
             .expect_get()
             .with(eq("RS_ZENOH_SUB_KEYEXPRS"))
@@ -436,6 +491,7 @@ mod tests {
             config_inline: Some("mode=client".to_string()),
             config_path: Some("/etc/zenoh.json5".to_string()),
             bucket: "sensor-data".to_string(),
+            max_block_records: Some(4096),
             sub_keyexprs: Some("**".to_string()),
             query_keyexprs: None,
             query_locality: ZenohQueryableLocality::Remote,
@@ -447,6 +503,7 @@ mod tests {
         let display = format!("{cfg}");
         assert!(display.contains("enabled=true"));
         assert!(display.contains("bucket=sensor-data"));
+        assert!(display.contains("max_block_records=4096"));
         assert!(display.contains("config=mode=client"));
         assert!(display.contains("config_path=/etc/zenoh.json5"));
         assert!(display.contains("sub_keyexprs=**"));

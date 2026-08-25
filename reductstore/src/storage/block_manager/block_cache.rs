@@ -124,6 +124,15 @@ impl BlockCache {
         }
     }
 
+    #[cfg(test)]
+    pub fn read_cache_contains(&self, block_id: &u64) -> bool {
+        self.read_cache
+            .read()
+            .unwrap()
+            .get(&self.read_key(*block_id))
+            .is_some()
+    }
+
     fn read_key(&self, block_id: u64) -> String {
         format!("{}::{}", self.namespace, block_id)
     }

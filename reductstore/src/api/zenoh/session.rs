@@ -7,6 +7,7 @@ use crate::api::zenoh::{
     subscriber::SubscriberPipeline,
 };
 use crate::cfg::zenoh::{ZenohApiConfig, ZenohQueryableLocality};
+use crate::storage::engine::StorageEngine;
 use bytes::Bytes;
 use log::{debug, error, info, warn};
 use reduct_base::error::ErrorCode;
@@ -38,6 +39,8 @@ struct CredentialFiles {
     auth_dictionary: Option<NamedTempFile>,
 }
 
+const MIN_RECOMMENDED_MAX_BLOCK_RECORDS: u64 = 16384;
+
 pub(crate) async fn run_session(
     config: ZenohApiConfig,
     state_keeper: Arc<StateKeeper>,
@@ -68,7 +71,7 @@ pub(crate) async fn run_session(
         }
     };
 
-    ensure_bucket_exists(&components, &config.bucket).await?;
+    ensure_bucket_exists(&components.storage, &config).await?;
 
     let (zenoh_config, _credential_files) = build_zenoh_config(&config)?;
 
@@ -137,12 +140,27 @@ pub(crate) async fn run_session(
 }
 
 async fn ensure_bucket_exists(
-    components: &Arc<crate::api::Components>,
-    bucket_name: &str,
+    storage: &StorageEngine,
+    config: &ZenohApiConfig,
 ) -> Result<(), SessionError> {
-    match components.storage.get_bucket(bucket_name).await {
-        Ok(_) => {
+    let bucket_name = config.bucket.as_str();
+    match storage.get_bucket(bucket_name).await {
+        Ok(bucket) => {
             info!("Zenoh target bucket '{}' exists", bucket_name);
+            let settings = bucket
+                .upgrade()
+                .map_err(|e| SessionError::Component(e.into()))?
+                .settings()
+                .await
+                .map_err(|e| SessionError::Component(e.into()))?;
+            if let Some(max_block_records) = settings.max_block_records {
+                if max_block_records < MIN_RECOMMENDED_MAX_BLOCK_RECORDS {
+                    info!(
+                        "Zenoh target bucket '{}' has max_block_records={}; for high-rate ingest consider raising it via PUT /api/v1/b/{}",
+                        bucket_name, max_block_records, bucket_name
+                    );
+                }
+            }
             Ok(())
         }
         Err(_) => {
@@ -150,9 +168,12 @@ async fn ensure_bucket_exists(
                 "Zenoh target bucket '{}' does not exist, creating...",
                 bucket_name
             );
-            components
-                .storage
-                .create_bucket(bucket_name, BucketSettings::default())
+            let settings = BucketSettings {
+                max_block_records: config.max_block_records,
+                ..Default::default()
+            };
+            storage
+                .create_bucket(bucket_name, settings)
                 .await
                 .map_err(|e| {
                     SessionError::InvalidConfig(format!(
@@ -374,7 +395,7 @@ fn ingest_worker_count() -> usize {
         .filter(|n| *n > 0)
         .unwrap_or_else(|| {
             std::thread::available_parallelism()
-                .map(|n| n.get().min(8))
+                .map(|n| n.get().min(16))
                 .unwrap_or(4)
         })
 }
@@ -847,6 +868,8 @@ impl Display for SessionError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cfg::Cfg;
+    use crate::storage::bucket::Bucket;
     use rstest::rstest;
     use std::fs;
     use std::time::Duration as StdDuration;
@@ -892,6 +915,60 @@ mod tests {
         let result = timestamp_from_microseconds(&labels, 750_000).unwrap();
 
         assert_eq!(result.get_id().to_string(), fallback_id.to_string());
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn ensure_bucket_exists_creates_bucket_with_configured_block_records() {
+        let storage = storage().await;
+        let config = ZenohApiConfig {
+            bucket: "zenoh-new".to_string(),
+            max_block_records: Some(65536),
+            ..ZenohApiConfig::default()
+        };
+
+        ensure_bucket_exists(&storage, &config).await.unwrap();
+
+        let bucket = storage.get_bucket("zenoh-new").await.unwrap();
+        let settings = bucket.upgrade().unwrap().settings().await.unwrap();
+        assert_eq!(settings.max_block_records, Some(65536));
+        assert_eq!(settings.max_block_size, Bucket::defaults().max_block_size);
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn ensure_bucket_exists_keeps_existing_bucket_settings() {
+        let storage = storage().await;
+        let existing = BucketSettings {
+            max_block_records: Some(100),
+            ..BucketSettings::default()
+        };
+        storage.create_bucket("zenoh-old", existing).await.unwrap();
+        let config = ZenohApiConfig {
+            bucket: "zenoh-old".to_string(),
+            max_block_records: Some(65536),
+            ..ZenohApiConfig::default()
+        };
+
+        ensure_bucket_exists(&storage, &config).await.unwrap();
+
+        let bucket = storage.get_bucket("zenoh-old").await.unwrap();
+        let settings = bucket.upgrade().unwrap().settings().await.unwrap();
+        assert_eq!(settings.max_block_records, Some(100));
+    }
+
+    async fn storage() -> Arc<StorageEngine> {
+        let cfg = Cfg {
+            data_path: tempfile::tempdir().unwrap().keep(),
+            ..Cfg::default()
+        };
+        Arc::new(
+            StorageEngine::builder()
+                .with_data_path(cfg.data_path.clone())
+                .with_cfg(cfg)
+                .build()
+                .await,
+        )
     }
 
     #[test]

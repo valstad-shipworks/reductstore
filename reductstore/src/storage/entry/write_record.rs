@@ -75,17 +75,15 @@ impl Entry {
             let mut bm = self.block_manager.write().await?;
             // When we write, the likely case is that we are writing the latest record
             // in the entry. In this case, we can just append to the latest block.
-            let active_index_tree = bm.index().active_tree();
-            let block_ref = if active_index_tree.is_empty() {
-                bm.start_new_block(time, settings.max_block_size).await?
-            } else {
-                let block_id = *active_index_tree.last().unwrap();
-                if bm.block_is_compressed(block_id) {
-                    bm.decompress_block(block_id).await?;
+            match bm.index().last_active_block_id() {
+                None => bm.start_new_block(time, settings.max_block_size).await?,
+                Some(block_id) => {
+                    if bm.block_is_compressed(block_id) {
+                        bm.decompress_block(block_id).await?;
+                    }
+                    bm.load_block(block_id).await?
                 }
-                bm.load_block(block_id).await?
-            };
-            block_ref
+            }
         };
 
         let _record_type = {
@@ -100,8 +98,8 @@ impl Entry {
                 );
                 // The timestamp is belated. We need to find the proper block to write to.
                 let mut bm = self.block_manager.write().await?;
-                let index_tree = bm.index().active_tree();
-                let record_type = if *index_tree.first().unwrap() > time {
+                let first_block_id = bm.index().first_active_block_id();
+                let record_type = if first_block_id.is_some_and(|block_id| block_id > time) {
                     // The timestamp is the earliest. We need to create a new block.
                     debug!(
                         "Timestamp {} is the earliest for {}/{}. Creating a new block",
@@ -224,6 +222,9 @@ impl Entry {
 #[cfg(test)]
 mod tests {
     use crate::cfg::Cfg;
+    use crate::core::sync::{
+        reset_rwlock_config, set_rwlock_failure_action, set_rwlock_timeout, RwLockFailureAction,
+    };
     use crate::storage::block_manager::compress::CompressionAlgorithm;
     use crate::storage::block_manager::{COMPRESSED_DATA_FILE_EXT, COMPRESSED_DESCRIPTOR_FILE_EXT};
     use crate::storage::entry::tests::{entry, path, write_stub_record};
@@ -236,6 +237,7 @@ mod tests {
     use serial_test::serial;
     use std::path::PathBuf;
     use std::sync::Arc;
+    use std::time::Duration;
 
     #[rstest]
     #[serial]
@@ -413,6 +415,41 @@ mod tests {
             records.get(&1000000).unwrap().timestamp,
             Some(us_to_ts(&1000000))
         );
+    }
+
+    #[rstest]
+    #[serial]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_concurrent_writers_same_entry(#[future] entry: Arc<Entry>) {
+        struct ResetGuard;
+        impl Drop for ResetGuard {
+            fn drop(&mut self) {
+                reset_rwlock_config();
+            }
+        }
+        let _reset = ResetGuard;
+        set_rwlock_failure_action(RwLockFailureAction::Error);
+        set_rwlock_timeout(Duration::from_secs(1));
+
+        let entry = entry.await;
+        let tasks: Vec<_> = (1..=4u64)
+            .map(|ts| {
+                let entry = entry.clone();
+                tokio::spawn(async move {
+                    let mut sender = entry
+                        .begin_write(ts, 1024, "text/plain".to_string(), Labels::new())
+                        .await?;
+                    sender.send(Ok(Some(Bytes::from(vec![0u8; 1024])))).await?;
+                    sender.send(Ok(None)).await?;
+                    Ok::<(), ReductError>(())
+                })
+            })
+            .collect();
+        for task in tasks {
+            task.await
+                .unwrap()
+                .expect("writer must not time out on entry locks");
+        }
     }
 
     #[rstest]
