@@ -556,10 +556,6 @@ fn ingest_worker_count() -> usize {
 /// congestion control takes over as backpressure.
 const INGEST_WORKER_QUEUE: usize = 256;
 
-/// Samples a worker takes per wake-up. Draining in batches amortizes the
-/// cross-thread wake-up that otherwise costs as much as the write itself.
-const INGEST_WORKER_BATCH: usize = 32;
-
 /// Ingest worker pool shared by every subscriber block. A sample's key picks
 /// its worker, so records of one entry keep arrival order while distinct
 /// entries are written in parallel.
@@ -575,16 +571,14 @@ impl IngestWorkers {
                 INGEST_WORKER_QUEUE,
             );
             handles.push(tokio::spawn(async move {
-                let mut batch = Vec::with_capacity(INGEST_WORKER_BATCH);
-                while rx.recv_many(&mut batch, INGEST_WORKER_BATCH).await > 0 {
-                    for (pipeline, sample) in batch.drain(..) {
-                        match handle_sample(&pipeline, sample).await {
-                            Ok(()) => {}
-                            // routing rejections are already reported by the pipeline, throttled
-                            Err(IngestFailure::Routing) => {}
-                            Err(IngestFailure::Other(err)) => {
-                                warn!("Failed to handle Zenoh sample: {}", err)
-                            }
+                while let Some((pipeline, sample)) = rx.recv().await {
+                    let key = sample.key_expr().to_string();
+                    match handle_sample(&pipeline, sample).await {
+                        Ok(()) => {}
+                        // routing rejections are already reported by the pipeline, throttled
+                        Err(IngestFailure::Routing) => {}
+                        Err(IngestFailure::Other(err)) => {
+                            warn!("Failed to handle Zenoh sample on '{}': {}", key, err)
                         }
                     }
                 }
@@ -639,12 +633,7 @@ async fn spawn_subscriber_block(
         handles.push(tokio::spawn(async move {
             loop {
                 match subscriber.recv_async().await {
-                    Ok(sample) => {
-                        workers.dispatch(&pipeline, sample).await;
-                        while let Ok(Some(sample)) = subscriber.try_recv() {
-                            workers.dispatch(&pipeline, sample).await;
-                        }
-                    }
+                    Ok(sample) => workers.dispatch(&pipeline, sample).await,
                     Err(err) => {
                         error!("Subscriber '{}' recv error: {}", key_expr, err);
                         break;
