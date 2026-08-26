@@ -639,7 +639,12 @@ async fn spawn_subscriber_block(
         handles.push(tokio::spawn(async move {
             loop {
                 match subscriber.recv_async().await {
-                    Ok(sample) => workers.dispatch(&pipeline, sample).await,
+                    Ok(sample) => {
+                        workers.dispatch(&pipeline, sample).await;
+                        while let Ok(Some(sample)) = subscriber.try_recv() {
+                            workers.dispatch(&pipeline, sample).await;
+                        }
+                    }
                     Err(err) => {
                         error!("Subscriber '{}' recv error: {}", key_expr, err);
                         break;
