@@ -93,6 +93,19 @@ impl Bucket {
         ))
     }
 
+    /// Drop a query without waiting out its TTL, for a reader that consumed it in one
+    /// request and would otherwise keep the entry receivers and aggregator alive.
+    ///
+    /// # Arguments
+    ///
+    /// * `query_id` - The unique identifier of the query.
+    ///
+    pub(crate) async fn remove_query(&self, query_id: u64) {
+        if let Ok(mut queries) = self.queries.write().await {
+            queries.remove(&query_id);
+        }
+    }
+
     async fn filter_entries(
         &self,
         request: &QueryEntry,

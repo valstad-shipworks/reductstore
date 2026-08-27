@@ -18,6 +18,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Add an opt-in benchmark API under `/api/v1/benchmark` (`RS_BENCHMARK_API=true`; `RS_BENCHMARK_MAX_TOTAL_SIZE`, `RS_BENCHMARK_MAX_RECORDS`, `RS_BENCHMARK_MAX_CONCURRENCY`, `RS_BENCHMARK_MAX_DURATION` cap requests) with raw disk, engine ingest, and read/query benchmarks
 - Add `RS_FS_FREE_SPACE_CHECK_INTERVAL_MS` to reuse the last free-space sample between writes instead of calling `statvfs` for every record
 - Configure the Zenoh API as `RS_ZENOH_SUB_<ID>_*` and `RS_ZENOH_QUERY_<ID>_*` blocks, each declaring one or more key expressions (`_KEYEXPRS`, comma separated) and its own target bucket (`_BUCKET`); `_ROUTING=key-prefix` additionally lets the first chunk of a key expression select the bucket, bounded by `_BUCKET_ALLOWLIST` and, for subscribers, `_ALLOW_BUCKET_CREATION`. The unindexed `RS_ZENOH_BUCKET` / `RS_ZENOH_SUB_KEYEXPRS` / `RS_ZENOH_QUERY_KEYEXPRS` / `RS_ZENOH_QUERY_LOCALITY` settings keep working as a single static block when no indexed variable is set, [Issue-1590](https://github.com/reductstore/reductstore/issues/1590)
+- Add a streaming read protocol on `POST /api/v1/io/{bucket}/stream`: one request answers a whole query, with record metadata framed into the response body instead of HTTP headers, so a read no longer costs a round trip per batch and is not capped by the client's inbound header limit. Servers advertise it as `read-stream` in the `x-reduct-api-features` response header; `/batch` and `/io/{bucket}/read` are unchanged. Tunable with `RS_IO_STREAM_FLUSH_SIZE` (default 64 KB) and `RS_IO_STREAM_KEEPALIVE` (default 15 s)
 - Expose the effective instance name and role in the `/api/v1/info` response, [PR-1569](https://github.com/reductstore/reductstore/pull/1569) by @lntutor
 - Automatically create missing destination buckets during replication, [PR-1539](https://github.com/reductstore/reductstore/pull/1539) by @rohankumardubey
 - Add a replication `compression` setting (`none`, `zstd`, `gzip`, default `none`) that compresses batch payloads during transfer using HTTP `Content-Encoding`, [Issue-1348](https://github.com/reductstore/reductstore/issues/1348) by @DibbayajyotiRoy
@@ -34,6 +35,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Update Web Console to v1.16.0, [PR-1607](https://github.com/reductstore/reductstore/pull/1607)
 - Default `RS_SYSTEM_EVENTS_QUOTA_SIZE` to 10 GB when it is not set, [PR-1556](https://github.com/reductstore/reductstore/pull/1556) by @LordAizen1
 - Allow fork pull request CI to run without protobuf setup tokens or Docker Hub credentials by vendoring `protoc` and making Docker login optional, [PR-1532](https://github.com/reductstore/reductstore/pull/1532)
 - Pipelined replication batch sending to overlap preparing the next batch with sending the current one, [PR-1527](https://github.com/reductstore/reductstore/pull/1527) by @DibbayajyotiRoy (based on [PR-1415](https://github.com/reductstore/reductstore/pull/1415) by @FirasCh3)

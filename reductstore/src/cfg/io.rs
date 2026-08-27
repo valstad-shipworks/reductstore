@@ -12,6 +12,8 @@ const DEFAULT_BATCH_MAX_METADATA_SIZE: u64 = 512000;
 const DEFAULT_BATCH_TIMEOUT_S: u64 = 5;
 const DEFAULT_BATCH_RECORDS_TIMEOUT_S: u64 = 1;
 const DEFAULT_OPERATION_TIMEOUT_S: u64 = 30;
+const DEFAULT_STREAM_FLUSH_SIZE: u64 = 65536;
+const DEFAULT_STREAM_KEEPALIVE_S: u64 = 15;
 
 /// IO configuration
 #[derive(Clone, Debug, PartialEq)]
@@ -28,6 +30,10 @@ pub struct IoConfig {
     pub batch_records_timeout: Duration,
     /// Maximum time to wait for an IO operation to complete
     pub operation_timeout: Duration,
+    /// Bytes a streamed read accumulates before handing a chunk to the socket
+    pub stream_flush_size: usize,
+    /// Idle time after which a streamed read emits a keep-alive frame
+    pub stream_keepalive: Duration,
     /// Maximum number of in-flight writers for storage engine.
     pub max_writers_in_flight: Option<usize>,
 }
@@ -41,6 +47,8 @@ impl Default for IoConfig {
             batch_timeout: Duration::from_secs(DEFAULT_BATCH_TIMEOUT_S),
             batch_records_timeout: Duration::from_secs(DEFAULT_BATCH_RECORDS_TIMEOUT_S),
             operation_timeout: Duration::from_secs(DEFAULT_OPERATION_TIMEOUT_S),
+            stream_flush_size: DEFAULT_STREAM_FLUSH_SIZE as usize,
+            stream_keepalive: Duration::from_secs(DEFAULT_STREAM_KEEPALIVE_S),
             max_writers_in_flight: None,
         }
     }
@@ -71,6 +79,14 @@ impl<EnvGetter: GetEnv, ExtCfg: ExtCfgBounds> CfgParser<EnvGetter, ExtCfg> {
             operation_timeout: Duration::from_secs(
                 env.get_optional("RS_IO_OPERATION_TIMEOUT")
                     .unwrap_or(DEFAULT_OPERATION_TIMEOUT_S),
+            ),
+            stream_flush_size: env
+                .get_optional::<ByteSize>("RS_IO_STREAM_FLUSH_SIZE")
+                .unwrap_or(ByteSize::b(DEFAULT_STREAM_FLUSH_SIZE))
+                .as_u64() as usize,
+            stream_keepalive: Duration::from_secs(
+                env.get_optional("RS_IO_STREAM_KEEPALIVE")
+                    .unwrap_or(DEFAULT_STREAM_KEEPALIVE_S),
             ),
             max_writers_in_flight: env
                 .get_optional::<usize>("RS_IO_MAX_WRITERS_IN_FLIGHT")
@@ -117,6 +133,14 @@ mod tests {
             .return_const(Ok("60".to_string()));
         env_getter
             .expect_get()
+            .with(eq("RS_IO_STREAM_FLUSH_SIZE"))
+            .return_const(Ok("128KB".to_string()));
+        env_getter
+            .expect_get()
+            .with(eq("RS_IO_STREAM_KEEPALIVE"))
+            .return_const(Ok("30".to_string()));
+        env_getter
+            .expect_get()
             .with(eq("RS_IO_MAX_WRITERS_IN_FLIGHT"))
             .return_const(Ok("2".to_string()));
 
@@ -126,6 +150,8 @@ mod tests {
             batch_max_metadata_size: 1000,
             batch_timeout: Duration::from_secs(10),
             batch_records_timeout: Duration::from_secs(5),
+            stream_flush_size: 128000,
+            stream_keepalive: Duration::from_secs(30),
             operation_timeout: Duration::from_secs(60),
             max_writers_in_flight: Some(2),
         };

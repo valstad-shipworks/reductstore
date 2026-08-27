@@ -4,12 +4,14 @@
 mod query;
 mod read;
 mod remove;
+mod stream;
 mod update;
 mod write;
 
 use crate::api::http::io::query::query;
 use crate::api::http::io::read::read_batched_records;
 use crate::api::http::io::remove::remove_batched_records;
+use crate::api::http::io::stream::stream_records;
 use crate::api::http::io::update::update_batched_records;
 use crate::api::http::io::write::write_batched_records;
 use crate::api::http::StateKeeper;
@@ -26,4 +28,5 @@ pub(super) fn create_io_api_routes() -> axum::Router<Arc<StateKeeper>> {
         .route("/{bucket_name}/remove", delete(remove_batched_records))
         .route("/{bucket_name}/update", patch(update_batched_records))
         .route("/{bucket_name}/q", post(query))
+        .route("/{bucket_name}/stream", post(stream_records))
 }
