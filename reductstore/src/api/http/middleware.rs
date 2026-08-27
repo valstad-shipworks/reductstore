@@ -11,10 +11,12 @@ use crate::api::http::HttpError;
 use crate::api::limits::limit_scope_from_client_ip;
 use axum::body::Body;
 use axum::extract::State;
+use axum::http::HeaderValue;
 use axum::http::{Request, StatusCode};
 use axum::middleware::Next;
 use axum::response::IntoResponse;
 use log::{debug, error, Level};
+use reduct_base::batch::{API_FEATURES_HEADER, READ_STREAM_FEATURE};
 use reduct_base::error::ErrorCode;
 use std::sync::Arc;
 
@@ -25,6 +27,9 @@ pub(super) async fn audit_requests(
 ) -> Result<impl IntoResponse, HttpError> {
     audit::audit_requests(state, request, next).await
 }
+
+/// Optional protocol features this build serves, beyond what `x-reduct-api` implies.
+const API_FEATURES: &str = READ_STREAM_FEATURE;
 
 pub(super) async fn default_headers(
     request: Request<Body>,
@@ -42,6 +47,9 @@ pub(super) async fn default_headers(
         "x-reduct-api",
         format!("{}.{}", tokens[0], tokens[1]).parse().unwrap(),
     );
+    response
+        .headers_mut()
+        .insert(API_FEATURES_HEADER, HeaderValue::from_static(API_FEATURES));
     Ok(response)
 }
 

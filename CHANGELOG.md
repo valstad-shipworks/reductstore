@@ -14,6 +14,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Add a streaming read protocol on `POST /api/v1/io/{bucket}/stream`: one request answers a whole query, with record metadata framed into the response body instead of HTTP headers, so a read no longer costs a round trip per batch and is not capped by the client's inbound header limit. Servers advertise it as `read-stream` in the `x-reduct-api-features` response header; `/batch` and `/io/{bucket}/read` are unchanged. Tunable with `RS_IO_STREAM_FLUSH_SIZE` (default 64 KB) and `RS_IO_STREAM_KEEPALIVE` (default 15 s)
 - Expose the effective instance name and role in the `/api/v1/info` response, [PR-1569](https://github.com/reductstore/reductstore/pull/1569) by @lntutor
 - Automatically create missing destination buckets during replication, [PR-1539](https://github.com/reductstore/reductstore/pull/1539) by @rohankumardubey
 - Add a replication `compression` setting (`none`, `zstd`, `gzip`, default `none`) that compresses batch payloads during transfer using HTTP `Content-Encoding`, [Issue-1348](https://github.com/reductstore/reductstore/issues/1348) by @DibbayajyotiRoy
