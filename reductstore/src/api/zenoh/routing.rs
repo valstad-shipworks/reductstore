@@ -5,8 +5,6 @@ use crate::cfg::zenoh::{ZenohBlock, ZenohBucketRouting};
 use crate::storage::entry::matches_patterns;
 use std::fmt::{Display, Formatter};
 
-const MAX_BUCKET_NAME_LEN: usize = 64;
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum RoutingMode {
     Static {
@@ -87,7 +85,6 @@ impl BucketRouter {
     pub(crate) fn from_block(block: &ZenohBlock) -> Self {
         let mode = match block.routing {
             ZenohBucketRouting::Static => RoutingMode::Static {
-                // a static block without a bucket is dropped while parsing
                 bucket: block.bucket.clone().unwrap_or_default(),
             },
             ZenohBucketRouting::KeyPrefix => RoutingMode::KeyPrefix {
@@ -96,7 +93,7 @@ impl BucketRouter {
         };
 
         BucketRouter {
-            block_id: block.id.clone(),
+            block_id: block.name().to_string(),
             mode,
             allowlist: block.bucket_allowlist.clone(),
             allow_bucket_creation: block.allow_bucket_creation,
@@ -209,30 +206,18 @@ impl BucketRouter {
 }
 
 fn validate_bucket_name(name: &str) -> Result<(), RoutingError> {
-    let reject = |reason: &str| {
-        Err(RoutingError::InvalidBucketName {
-            bucket: name.to_string(),
-            reason: reason.to_string(),
-        })
-    };
-
     if name.is_empty() {
-        return reject("is empty");
+        return Err(RoutingError::InvalidBucketName {
+            bucket: name.to_string(),
+            reason: "is empty".to_string(),
+        });
     }
-    if name.len() > MAX_BUCKET_NAME_LEN {
-        return reject(&format!(
-            "is longer than {} characters",
-            MAX_BUCKET_NAME_LEN
-        ));
-    }
-    // rejecting '$' keeps a key expression from reaching a system bucket
-    if !name
-        .chars()
-        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
-    {
-        return reject("may contain only letters, digits and [-,_] symbols");
-    }
-    Ok(())
+    crate::storage::engine::check_name_convention(name).map_err(|_| {
+        RoutingError::InvalidBucketName {
+            bucket: name.to_string(),
+            reason: "may contain only letters, digits and [-,_] symbols".to_string(),
+        }
+    })
 }
 
 fn validate_entry_name(entry: &str) -> Result<(), RoutingError> {
@@ -251,7 +236,7 @@ mod tests {
 
     fn block(routing: ZenohBucketRouting, bucket: Option<&str>, allowlist: &[&str]) -> ZenohBlock {
         ZenohBlock {
-            id: "0".to_string(),
+            id: Some("0".to_string()),
             keyexprs: vec!["**".to_string()],
             routing,
             bucket: bucket.map(|name| name.to_string()),
@@ -338,15 +323,8 @@ mod tests {
     }
 
     #[rstest]
-    fn rejects_over_long_derived_bucket_name() {
-        let key = format!("{}/entry", "a".repeat(MAX_BUCKET_NAME_LEN + 1));
-        let err = key_prefix(None, &["*"], true).resolve(&key).unwrap_err();
-        assert!(matches!(err, RoutingError::InvalidBucketName { .. }));
-    }
-
-    #[rstest]
-    fn accepts_bucket_name_at_the_length_limit() {
-        let name = "a".repeat(MAX_BUCKET_NAME_LEN);
+    fn accepts_a_long_derived_bucket_name() {
+        let name = "a".repeat(200);
         let key = format!("{}/entry", name);
         let router = key_prefix(None, &["*"], true);
         let route = router.resolve(&key).unwrap();

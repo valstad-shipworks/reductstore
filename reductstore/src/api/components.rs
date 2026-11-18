@@ -3,6 +3,7 @@
 
 //! Server-wide shared state used by all API layers (HTTP, Zenoh).
 
+use crate::api::license_device_guard::LicenseDeviceGuard;
 use crate::api::limits::BoxedLimits;
 use crate::asset::asset_manager::ManageStaticAsset;
 use crate::auth::policy::Policy;
@@ -10,6 +11,7 @@ use crate::auth::token_auth::TokenAuthorization;
 use crate::auth::token_repository::ManageTokens;
 use crate::cfg::Cfg;
 use crate::core::cache::Cache;
+use crate::core::deployment_id::{NodeId, StoreId};
 use crate::core::sync::AsyncRwLock;
 use crate::ext::ext_repository::ManageExtensions;
 use crate::lifecycle::ManageLifecycles;
@@ -31,6 +33,8 @@ use tokio::sync::Mutex;
 
 /// Core server components shared across all APIs.
 pub struct Components {
+    pub store_id: StoreId,
+    pub node_id: NodeId,
     pub storage: Arc<StorageEngine>,
     pub(crate) auth: TokenAuthorization,
     pub(crate) token_repo: AsyncRwLock<Box<dyn ManageTokens + Send + Sync>>,
@@ -42,6 +46,7 @@ pub struct Components {
     pub(crate) ext_repo: Box<dyn ManageExtensions + Send + Sync>,
     pub(crate) query_link_cache: AsyncRwLock<Cache<String, Arc<Mutex<BoxedReadRecord>>>>,
     pub(crate) limits: BoxedLimits,
+    pub(crate) license_device_guard: LicenseDeviceGuard,
     /// The single system-event collector: owns every aggregator/task (audit
     /// batching, usage timer, log capture) and the one shared `$system` writer
     /// they fan through. A no-op when system events are disabled, so no `Option`
@@ -87,6 +92,7 @@ impl StateKeeper {
             .and_then(|header| header.to_str().ok())
             .and_then(|value| value.parse::<IpAddr>().ok());
 
+        let mut repo = components.token_repo.write().await?;
         components
             .auth
             .check(
@@ -94,10 +100,13 @@ impl StateKeeper {
                     .get("Authorization")
                     .map(|header| header.to_str().unwrap_or("")),
                 client_ip,
-                components.token_repo.write().await?.as_mut(),
+                repo.as_mut(),
                 policy,
             )
             .await?;
+        drop(repo);
+
+        components.license_device_guard.check(headers)?;
 
         Ok(components)
     }

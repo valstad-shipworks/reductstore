@@ -2,7 +2,6 @@
 // Licensed under the Apache License, Version 2.0
 
 use super::{normalize_entry_name, settings_for_entry, Bucket};
-use crate::core::file_cache::FILE_CACHE;
 use crate::storage::engine::check_entry_name_convention;
 use crate::storage::entry::Entry;
 use reduct_base::conflict;
@@ -34,6 +33,7 @@ impl Bucket {
                     .cfg(self.cfg.clone())
                     .io_limiter(self.io_limiter.clone())
                     .usage_counters(Arc::clone(&self.usage_counters))
+                    .file_cache(Arc::clone(&self.file_cache))
                     .restore(),
             );
         }
@@ -83,7 +83,7 @@ impl Bucket {
             ));
         }
 
-        if FILE_CACHE.try_exists(&new_path).await? {
+        if self.file_cache.try_exists(&new_path).await? {
             return Err(conflict!(
                 "Entry '{}' already exists in bucket '{}'",
                 new_name,
@@ -159,7 +159,7 @@ impl Bucket {
 mod tests {
     use super::*;
     use crate::cfg::Cfg;
-    use crate::core::file_cache::FILE_CACHE;
+    use crate::core::file_cache::build_test_file_cache;
     use crate::core::sync::rwlock_timeout;
     use prost::bytes::Bytes;
     use reduct_base::error::ErrorCode;
@@ -173,7 +173,7 @@ mod tests {
     use std::path::PathBuf;
     use std::time::Duration;
     use tempfile::tempdir;
-    use tokio::time::sleep;
+    use tokio::time::{sleep, timeout};
 
     #[rstest]
     #[tokio::test]
@@ -282,10 +282,18 @@ mod tests {
 
         let entries_guard = bucket.entries.read().await.unwrap();
         let bucket_for_rename = bucket.clone();
+        let target_path = bucket.path.join("test-2");
         let handle =
             tokio::spawn(async move { bucket_for_rename.rename_entry("test-1", "test-2").await });
 
-        sleep(rwlock_timeout() + Duration::from_millis(1000)).await;
+        timeout(Duration::from_secs(5), async {
+            while !target_path.exists() {
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        sleep(rwlock_timeout() + Duration::from_millis(100)).await;
         drop(entries_guard);
 
         let err = handle.await.unwrap().err().unwrap();
@@ -434,6 +442,7 @@ mod tests {
             .send(Ok(None))
             .await
             .map_err(|e| internal_server_error!("Failed to sync channel: {}", e))?;
+        bucket.sync_fs().await?;
         Ok(())
     }
 
@@ -460,6 +469,7 @@ mod tests {
             .send(Ok(None))
             .await
             .map_err(|e| internal_server_error!("Failed to sync channel: {}", e))?;
+        bucket.sync_fs().await?;
         Ok(())
     }
 
@@ -480,7 +490,8 @@ mod tests {
 
     #[fixture]
     pub async fn bucket(settings: BucketSettings, path: PathBuf) -> Arc<Bucket> {
-        FILE_CACHE.create_dir_all(&path.join("test")).await.unwrap();
+        let file_cache = build_test_file_cache();
+        file_cache.create_dir_all(&path.join("test")).await.unwrap();
         Arc::new(
             Bucket::builder()
                 .name("test")
@@ -488,6 +499,7 @@ mod tests {
                 .settings(settings)
                 .cfg(Cfg::default())
                 .usage_counters(Default::default())
+                .file_cache(file_cache)
                 .build()
                 .await
                 .unwrap(),

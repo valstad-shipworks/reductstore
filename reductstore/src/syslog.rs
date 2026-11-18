@@ -16,7 +16,6 @@ use crate::cfg::Cfg;
 use crate::core::sync::AsyncRwLock;
 use crate::storage::engine::StorageEngine;
 use crate::storage::usage::UsageCounters;
-use aggregate::audit::BoxedSystemEventAggregator;
 use async_trait::async_trait;
 use log::error;
 use reduct_base::error::ReductError;
@@ -26,6 +25,7 @@ use tokio::sync::Mutex;
 
 pub(crate) use aggregate::usage::UsageEventAggregator;
 pub(crate) use event::{SystemEvent, SystemEventKind};
+pub(crate) use path::sanitize_path_segment;
 pub(crate) use sink::{BoxedSystemLogger, LogSystemEvent, ReplicationNotifier, SystemEventSink};
 use system_event_logger::SystemEventLoggerBuilder;
 
@@ -213,12 +213,12 @@ struct DisabledSystemEventLogger {
 #[async_trait]
 impl SystemEventLogger for DisabledSystemEventLogger {
     fn sink(&self) -> SystemEventSink {
-        SystemEventSink {
-            system_logger: Arc::new(AsyncRwLock::new(
+        SystemEventSink::new(
+            Arc::new(AsyncRwLock::new(
                 Box::new(DisabledSystemLogger) as BoxedSystemLogger
             )),
-            instance_name: self.instance_name.clone(),
-        }
+            self.instance_name.clone(),
+        )
     }
 
     async fn stop(&self) {}
@@ -229,7 +229,7 @@ impl SystemEventLogger for DisabledSystemEventLogger {
 /// (synchronously, so producers like lifecycle and replication keep their
 /// write-then-read semantics).
 struct RoutingSystemLogger {
-    audit: BoxedSystemEventAggregator,
+    audit: aggregate::audit::SharedSystemEventAggregator,
     writer: Arc<AsyncRwLock<BoxedSystemLogger>>,
 }
 
@@ -254,6 +254,7 @@ impl LogSystemEvent for RoutingSystemLogger {
 struct EnabledSystemEventLogger {
     /// The [`RoutingSystemLogger`] every family emits through.
     sink_logger: Arc<AsyncRwLock<BoxedSystemLogger>>,
+    audit: aggregate::audit::SharedSystemEventAggregator,
     instance_name: String,
     /// Usage traffic timer (drops/drains on `stop`).
     usage: Mutex<Option<UsageEventAggregator>>,
@@ -265,10 +266,8 @@ struct EnabledSystemEventLogger {
 #[async_trait]
 impl SystemEventLogger for EnabledSystemEventLogger {
     fn sink(&self) -> SystemEventSink {
-        SystemEventSink {
-            system_logger: Arc::clone(&self.sink_logger),
-            instance_name: self.instance_name.clone(),
-        }
+        SystemEventSink::new(Arc::clone(&self.sink_logger), self.instance_name.clone())
+            .with_audit_aggregator(Arc::clone(&self.audit))
     }
 
     async fn set_replication_notifier(&self, notifier: Option<ReplicationNotifier>) {
@@ -315,16 +314,14 @@ pub(crate) async fn build_system_event_logger(
     // by the aggregator, all other kinds pass straight through to `writer`.
     let sink_logger: Arc<AsyncRwLock<BoxedSystemLogger>> =
         Arc::new(AsyncRwLock::new(Box::new(RoutingSystemLogger {
-            audit,
+            audit: Arc::clone(&audit),
             writer,
         })));
 
     // Usage timer drains the shared traffic counters and emits through the sink.
     let usage = UsageEventAggregator::new(
-        SystemEventSink {
-            system_logger: Arc::clone(&sink_logger),
-            instance_name: instance_name.clone(),
-        },
+        SystemEventSink::new(Arc::clone(&sink_logger), instance_name.clone())
+            .with_audit_aggregator(Arc::clone(&audit)),
         Arc::clone(&storage),
         counters,
     );
@@ -333,10 +330,8 @@ pub(crate) async fn build_system_event_logger(
     // and when no persist level is configured.
     let log_capture = match cfg.system_events_conf.log_level {
         Some(persist_level) if cfg.role != crate::cfg::InstanceRole::Replica => {
-            let sink = SystemEventSink {
-                system_logger: Arc::clone(&sink_logger),
-                instance_name: instance_name.clone(),
-            };
+            let sink = SystemEventSink::new(Arc::clone(&sink_logger), instance_name.clone())
+                .with_audit_aggregator(Arc::clone(&audit));
             Some(LogCapture::new(sink, persist_level, &cfg.log_level))
         }
         _ => None,
@@ -344,6 +339,7 @@ pub(crate) async fn build_system_event_logger(
 
     Arc::new(EnabledSystemEventLogger {
         sink_logger,
+        audit,
         instance_name,
         usage: Mutex::new(Some(usage)),
         log_capture: Mutex::new(log_capture),
@@ -882,6 +878,7 @@ mod tests {
     mod routing {
         use super::*;
         use std::sync::Mutex as StdMutex;
+        use tokio::sync::Notify;
 
         #[derive(Clone)]
         struct CapturingWriter {
@@ -896,6 +893,20 @@ mod tests {
             }
         }
 
+        struct BlockingWriter {
+            started: Arc<Notify>,
+            release: Arc<Notify>,
+        }
+
+        #[async_trait]
+        impl LogSystemEvent for BlockingWriter {
+            async fn log_event(&mut self, _event: SystemEvent) -> Result<(), ReductError> {
+                self.started.notify_one();
+                self.release.notified().await;
+                Ok(())
+            }
+        }
+
         fn routing_sink() -> (SystemEventSink, Arc<StdMutex<Vec<SystemEvent>>>) {
             let events = Arc::new(StdMutex::new(Vec::new()));
             let writer: Arc<AsyncRwLock<BoxedSystemLogger>> =
@@ -903,13 +914,12 @@ mod tests {
                     events: Arc::clone(&events),
                 })));
             let audit = aggregate::audit::build_audit_aggregator(Arc::clone(&writer));
-            let sink = SystemEventSink {
-                system_logger: Arc::new(AsyncRwLock::new(Box::new(RoutingSystemLogger {
-                    audit,
-                    writer,
-                }) as BoxedSystemLogger)),
-                instance_name: "instance-1".to_string(),
-            };
+            let sink_logger = Arc::new(AsyncRwLock::new(Box::new(RoutingSystemLogger {
+                audit: Arc::clone(&audit),
+                writer,
+            }) as BoxedSystemLogger));
+            let sink = SystemEventSink::new(sink_logger, "instance-1".to_string())
+                .with_audit_aggregator(audit);
             (sink, events)
         }
 
@@ -923,13 +933,7 @@ mod tests {
             let mut event = make_event();
             event.kind = SystemEventKind::Lifecycle;
             event.event_type = "lifecycle_run".to_string();
-            sink.system_logger
-                .write()
-                .await
-                .unwrap()
-                .log_event(event)
-                .await
-                .unwrap();
+            sink.log_event(event).await.unwrap();
 
             let captured = events.lock().unwrap();
             assert_eq!(captured.len(), 1);
@@ -942,13 +946,7 @@ mod tests {
         async fn routes_audit_events_through_the_batching_aggregator() {
             let (sink, events) = routing_sink();
 
-            sink.system_logger
-                .write()
-                .await
-                .unwrap()
-                .log_event(make_event())
-                .await
-                .unwrap();
+            sink.log_event(make_event()).await.unwrap();
 
             assert!(
                 events.lock().unwrap().is_empty(),
@@ -959,6 +957,40 @@ mod tests {
             let captured = events.lock().unwrap();
             assert_eq!(captured.len(), 1, "batched audit event must be flushed");
             assert_eq!(captured[0].kind, SystemEventKind::Audit);
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn enqueues_audit_events_while_a_synchronous_write_holds_the_routing_lock() {
+            let started = Arc::new(Notify::new());
+            let release = Arc::new(Notify::new());
+            let writer: Arc<AsyncRwLock<BoxedSystemLogger>> =
+                Arc::new(AsyncRwLock::new(Box::new(BlockingWriter {
+                    started: Arc::clone(&started),
+                    release: Arc::clone(&release),
+                })));
+            let audit = aggregate::audit::build_audit_aggregator(Arc::clone(&writer));
+            let sink_logger = Arc::new(AsyncRwLock::new(Box::new(RoutingSystemLogger {
+                audit: Arc::clone(&audit),
+                writer,
+            }) as BoxedSystemLogger));
+            let sink = SystemEventSink::new(sink_logger, "instance-1".to_string())
+                .with_audit_aggregator(audit);
+
+            let mut lifecycle_event = make_event();
+            lifecycle_event.kind = SystemEventKind::Lifecycle;
+            lifecycle_event.event_type = "lifecycle_run".to_string();
+            let blocked_sink = sink.clone();
+            let blocked_write =
+                tokio::spawn(async move { blocked_sink.log_event(lifecycle_event).await });
+            started.notified().await;
+
+            tokio::time::timeout(Duration::from_millis(100), sink.log_event(make_event()))
+                .await
+                .expect("audit enqueue must not wait for the synchronous writer")
+                .unwrap();
+
+            release.notify_one();
+            blocked_write.await.unwrap().unwrap();
         }
     }
 }

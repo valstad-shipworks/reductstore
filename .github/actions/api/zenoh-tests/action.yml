@@ -22,9 +22,9 @@ inputs:
     required: false
     default: ''
   routing_mode:
-    description: 'Zenoh routing configuration: "legacy" for the unindexed settings, "indexed" for RS_ZENOH_{SUB,QUERY}_<ID>_* blocks.'
+    description: 'Zenoh routing configuration: "unindexed" for no-ID settings, "indexed" for RS_ZENOH_{SUB,QUERY}_<ID>_* blocks.'
     required: false
-    default: 'legacy'
+    default: 'unindexed'
 runs:
   using: 'composite'
   steps:
@@ -73,21 +73,12 @@ runs:
       env:
         ROUTING_MODE: ${{ inputs.routing_mode }}
       run: |
-        # written to a file so the '*' and '$*' wildcards survive shell expansion
         if [ "$ROUTING_MODE" = "indexed" ]; then
-          cat > /tmp/zenoh-routing.env <<'EOF'
-        RS_ZENOH_SUB_0_KEYEXPRS=entry_$*,factory/**
-        RS_ZENOH_SUB_0_BUCKET=zenoh
-        RS_ZENOH_SUB_1_KEYEXPRS=rt_$*/**
-        RS_ZENOH_SUB_1_ROUTING=key-prefix
-        RS_ZENOH_SUB_1_BUCKET_ALLOWLIST=rt_site_*
-        RS_ZENOH_SUB_1_ALLOW_BUCKET_CREATION=true
-        RS_ZENOH_QUERY_0_KEYEXPRS=entry_$*,factory/**
-        RS_ZENOH_QUERY_0_BUCKET=zenoh
-        RS_ZENOH_QUERY_1_KEYEXPRS=rt_$*/**
-        RS_ZENOH_QUERY_1_ROUTING=key-prefix
-        RS_ZENOH_QUERY_1_BUCKET_ALLOWLIST=rt_site_*
-        EOF
+          source integration_tests/zenoh/routing/env.sh
+          : > /tmp/zenoh-routing.env
+          for variable in "${ZENOH_ROUTING_ENV_VARS[@]}"; do
+            printf '%s=%s\n' "$variable" "${!variable}" >> /tmp/zenoh-routing.env
+          done
           echo "routing_tests=1" >> $GITHUB_OUTPUT
         else
           cat > /tmp/zenoh-routing.env <<'EOF'

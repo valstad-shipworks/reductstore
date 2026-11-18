@@ -149,6 +149,7 @@ impl LogCapture {
                 error!("Log capture task failed to join: {:?}", err);
             }
         }
+        Logger::clear_sink();
 
         let dropped = self.dropped.load(Ordering::Relaxed);
         if dropped > 0 {
@@ -228,10 +229,7 @@ mod tests {
     }
 
     fn sink_with(logger: Box<dyn LogSystemEvent + Send + Sync>) -> SystemEventSink {
-        SystemEventSink {
-            system_logger: Arc::new(AsyncRwLock::new(logger)),
-            instance_name: "instance-1".to_string(),
-        }
+        SystemEventSink::new(Arc::new(AsyncRwLock::new(logger)), "instance-1".to_string())
     }
 
     /// A logger whose write path itself re-enters the enqueue path — exactly the

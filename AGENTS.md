@@ -26,6 +26,7 @@
 - Place private functions at the end of their module or implementation block.
 - `rustfmt` (imports reordered via `.rustfmt.toml`) is required before commits.
 - Prefer `?` over `unwrap` in non-test code; keep errors contextual.
+- Use `crate::core::sync::AsyncRwLock` for async coordination locks, including exclusive-only guards, so lock timeouts are returned as `ReductError` instead of waiting indefinitely. Use Tokio primitives only when a timeout cannot be surfaced to the caller.
 - Python in `integration_tests` should pass `black .` and avoid leaking secrets in logs.
 
 ## Testing Guidelines
@@ -57,3 +58,4 @@
 - Default data root is `RS_DATA_PATH` (`/data` in containers); avoid committing real keys or licenses—use sample PEMs in
   `misc/`.
 - S3 backend needs `s3-backend` plus AWS credentials/env vars; prefer env vars over checked-in config.
+- Do not use `apt-get` in the final Docker image stage.

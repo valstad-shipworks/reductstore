@@ -110,6 +110,10 @@ impl BlockCache {
 
     pub(crate) fn clear(&self) {
         self.write_cache.write().unwrap().clear();
+        self.clear_read();
+    }
+
+    pub(crate) fn clear_read(&self) {
         let mut read_cache = self.read_cache.write().unwrap();
         let prefix = self.read_key_prefix();
         let keys_to_remove = read_cache

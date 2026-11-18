@@ -10,6 +10,7 @@ use tempfile::{tempdir, TempDir};
 use zip::ZipArchive;
 
 use reduct_base::error::ReductError;
+use reduct_base::not_found;
 
 pub trait ManageStaticAsset {
     /// Read a file from the zip archive.
@@ -62,14 +63,17 @@ impl ZipAssetManager {
 
         for i in 0..archive.len() {
             let mut file = archive.by_index(i).unwrap();
+            let enclosed_name = file
+                .enclosed_name()
+                .expect("Zip archive contains an unsafe path");
             if file.is_dir() {
-                let path = temp_dir.path().join(file.name());
+                let path = temp_dir.path().join(&enclosed_name);
                 std::fs::create_dir_all(path).unwrap();
             }
 
             if file.is_file() {
                 // extract file to temporary directory without root directory
-                let path = temp_dir.path().join(file.name());
+                let path = temp_dir.path().join(enclosed_name);
                 debug!("Extracting file to {:?}", path);
                 let mut out = File::create(path).unwrap();
                 std::io::copy(&mut file, &mut out).unwrap();
@@ -87,9 +91,7 @@ impl ManageStaticAsset for ZipAssetManager {
 
         trace!("Reading file {:?}", path);
         if !path.try_exists()? {
-            return Err(ReductError::not_found(
-                format!("File {:?} not found", path).as_str(),
-            ));
+            return Err(not_found!("File {:?} not found", path));
         }
 
         // read file
@@ -103,9 +105,7 @@ impl ManageStaticAsset for ZipAssetManager {
     fn absolut_path(&self, relative_path: &str) -> Result<PathBuf, ReductError> {
         let path = self.path.path().join(relative_path);
         if !path.try_exists()? {
-            return Err(ReductError::not_found(
-                format!("File {:?} not found", path).as_str(),
-            ));
+            return Err(not_found!("File {:?} not found", path));
         }
         Ok(path)
     }

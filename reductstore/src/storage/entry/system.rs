@@ -17,8 +17,7 @@ use serde_json::json;
 /// - `$meta` entries are excluded from user-facing entry counts/lists.
 /// - FIFO quota eviction must ignore `$meta` entries as removal candidates.
 /// - Every `$meta` record must include label `key`.
-/// - `$meta` behaves as upsert-by-key: writing a record with `key=K` removes existing `$meta`
-///   records with the same key before adding the new one.
+/// - `$meta` retains attachment versions; readers select the latest record for each key.
 /// - Updating a `$meta` record with label `remove=true` creates a tombstone (label-only update)
 ///   and does not physically delete the record.
 pub(crate) const META_ENTRY_SEGMENT: &str = "$meta";
@@ -67,8 +66,6 @@ pub(crate) trait SystemEntryBehavior {
     }
 
     async fn prepare_write(&self, entry: &Entry, labels: &Labels) -> Result<(), ReductError>;
-
-    fn apply_default_query_filters(&self, query: &mut QueryEntry);
 }
 
 pub(crate) struct RegularEntryBehavior;
@@ -78,8 +75,6 @@ impl SystemEntryBehavior for RegularEntryBehavior {
     async fn prepare_write(&self, _entry: &Entry, _labels: &Labels) -> Result<(), ReductError> {
         Ok(())
     }
-
-    fn apply_default_query_filters(&self, _query: &mut QueryEntry) {}
 }
 
 pub(crate) struct MetaEntryBehavior;
@@ -101,16 +96,15 @@ impl SystemEntryBehavior for MetaEntryBehavior {
             ));
         }
 
-        // escape system names started with $
+        // Preserve the current attachment while pruning older history before
+        // the replacement starts. This leaves at most one prior version.
         let key = if key.starts_with('$') {
             format!("${}", key)
         } else {
             key.to_string()
         };
-
-        // remove previous version with the same key (upsert-by-key behavior)
-        let _ = entry
-            .query_remove_records(QueryEntry {
+        let mut timestamps = entry
+            .query_record_timestamps(QueryEntry {
                 start: Some(0),
                 stop: Some(u64::MAX),
                 when: Some(json!({
@@ -120,30 +114,11 @@ impl SystemEntryBehavior for MetaEntryBehavior {
                 ..Default::default()
             })
             .await?;
+        timestamps.sort_unstable();
+        timestamps.pop();
+        entry.remove_records_in_current_mutation(timestamps).await?;
+
         Ok(())
-    }
-
-    fn apply_default_query_filters(&self, query: &mut QueryEntry) {
-        // Filter out tombstoned records (remove=true) by injecting $not condition
-        let exclude = json!([{
-            "$and": [
-                {"$has": "remove"}, {"&remove": {"$eq": true}}
-            ]
-        }]);
-
-        let when = query.when.get_or_insert_with(|| json!({}));
-        match when.as_object_mut().unwrap().entry("$not") {
-            serde_json::map::Entry::Vacant(entry) => {
-                entry.insert(exclude);
-            }
-            serde_json::map::Entry::Occupied(mut entry) => {
-                entry
-                    .get_mut()
-                    .as_array_mut()
-                    .unwrap()
-                    .push(exclude.get(0).unwrap().clone());
-            }
-        }
     }
 
     fn validate_remove_records(&self, entry_name: &str) -> Result<(), ReductError> {
@@ -197,10 +172,14 @@ pub(crate) fn validate_remove_entry(entry_name: &str) -> Result<(), ReductError>
 mod tests {
     use super::*;
     use crate::cfg::Cfg;
+    use crate::storage::entry::update_labels::UpdateLabels;
     use crate::storage::entry::{Entry, EntrySettings};
     use bytes::Bytes;
     use reduct_base::error::ReductError;
+    use reduct_base::io::ReadRecord;
     use serial_test::serial;
+    use std::collections::HashSet;
+    use std::sync::Arc;
     use tempfile::tempdir;
 
     async fn build_entry(name: &str) -> Entry {
@@ -314,7 +293,7 @@ mod tests {
 
     #[tokio::test]
     #[serial]
-    async fn meta_prepare_write_removes_existing_records_with_same_key() {
+    async fn meta_write_retains_only_the_previous_version() {
         let entry = build_entry("entry/$meta").await;
         write_record(
             &entry,
@@ -324,14 +303,86 @@ mod tests {
         .await;
         assert!(entry.begin_read(1).await.is_ok());
 
-        MetaEntryBehavior
-            .prepare_write(
+        write_record(
+            &entry,
+            2,
+            Labels::from_iter([("key".to_string(), "schema".to_string())]),
+        )
+        .await;
+        assert!(entry.begin_read(1).await.is_ok());
+        assert!(entry.begin_read(2).await.is_ok());
+
+        write_record(
+            &entry,
+            3,
+            Labels::from_iter([("key".to_string(), "schema".to_string())]),
+        )
+        .await;
+        assert!(entry.begin_read(1).await.is_err());
+        assert!(entry.begin_read(2).await.is_ok());
+        assert!(entry.begin_read(3).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn meta_query_excludes_tombstones_and_preserves_not_filters() {
+        let entry = Arc::new(build_entry("entry/$meta").await);
+        for (timestamp, key, category) in [
+            (1, "shared", "included"),
+            (2, "shared", "included"),
+            (3, "excluded", "excluded"),
+            (4, "shown", "included"),
+        ] {
+            write_record(
                 &entry,
-                &Labels::from_iter([("key".to_string(), "schema".to_string())]),
+                timestamp,
+                Labels::from_iter([
+                    ("key".to_string(), key.to_string()),
+                    ("category".to_string(), category.to_string()),
+                ]),
             )
+            .await;
+        }
+
+        entry
+            .clone()
+            .update_labels(vec![UpdateLabels {
+                time: 1,
+                update: Labels::from_iter([("remove".to_string(), "true".to_string())]),
+                remove: HashSet::new(),
+            }])
             .await
             .unwrap();
 
-        assert!(entry.begin_read(1).await.is_err());
+        assert_eq!(query_timestamps(&entry, None).await, vec![3, 4]);
+        assert_eq!(
+            query_timestamps(
+                &entry,
+                Some(json!({
+                    "$not": [{"&category": {"$eq": "excluded"}}]
+                })),
+            )
+            .await,
+            vec![4]
+        );
+    }
+
+    async fn query_timestamps(entry: &Entry, when: Option<serde_json::Value>) -> Vec<u64> {
+        let id = entry
+            .query(QueryEntry {
+                when,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let (rx, _) = entry.get_query_receiver(id).await.unwrap();
+        let rx = rx.upgrade_and_unwrap();
+        let mut rx = rx.write().await.unwrap();
+        let mut timestamps = Vec::new();
+
+        while let Some(Ok(record)) = rx.recv().await {
+            timestamps.push(record.meta().timestamp());
+        }
+
+        timestamps
     }
 }

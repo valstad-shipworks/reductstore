@@ -29,10 +29,9 @@ impl Entry {
             let bm = self.block_manager.read().await?;
             bm.find_cached_block(time)
         } {
-            let block = block_ref.read().await?;
-            if let Some(record) = block.get_record(time) {
-                let record = record.clone();
-                drop(block);
+            // release the block first: the fallback takes the block manager lock
+            let cached = block_ref.read().await?.get_record(time).cloned();
+            if let Some(record) = cached {
                 (block_ref, record)
             } else {
                 self.find_record_for_read(time).await?
@@ -64,7 +63,7 @@ impl Entry {
 
     async fn find_record_for_read(&self, time: u64) -> Result<(BlockRef, Record), ReductError> {
         let mut bm = self.block_manager.write().await?;
-        let block_ref = bm.find_block(time).await?;
+        let block_ref = bm.find_block_with_record(time).await?;
         let block = block_ref.read().await?;
         let record = block
             .get_record(time)
@@ -88,11 +87,11 @@ impl Entry {
 mod tests {
     use super::*;
     use crate::cfg::{Cfg, InstanceRole};
-    use crate::core::file_cache::FILE_CACHE;
+    use crate::core::file_cache::FileCache;
     use crate::storage::block_manager::DATA_FILE_EXT;
     use crate::storage::engine::MAX_IO_BUFFER_SIZE;
     use crate::storage::entry::tests::{
-        entry, entry_settings, path, write_record, write_stub_record,
+        entry, entry_settings, file_cache, path, write_record, write_stub_record,
     };
     use crate::storage::entry::EntrySettings;
     use bytes::Bytes;
@@ -211,7 +210,7 @@ mod tests {
 
         {
             let mut bm = entry.block_manager.write().await.unwrap();
-            let _ = bm.find_block(1000000).await.unwrap();
+            let _ = bm.find_block_candidate(1000000).await.unwrap();
         }
         let reader = entry.begin_read(2000000).await;
         assert_eq!(
@@ -230,10 +229,10 @@ mod tests {
 
         let data_path = {
             let bm = entry.block_manager.read().await.unwrap();
-            let block_id = *bm.index().tree().first().unwrap();
+            let block_id = *bm.index().block_ids().first().unwrap();
             bm.path().join(format!("{}{}", block_id, DATA_FILE_EXT))
         };
-        FILE_CACHE.remove(&data_path).await.unwrap();
+        entry.file_cache.remove(&data_path).await.unwrap();
 
         let reader = entry.begin_read(1000000).await;
         assert_eq!(
@@ -269,24 +268,18 @@ mod tests {
     async fn test_begin_read_missing_data_file_on_replica_returns_too_early(
         entry_settings: EntrySettings,
         path: PathBuf,
+        file_cache: Arc<FileCache>,
     ) {
-        let entry = entry(entry_settings.clone(), path.clone()).await;
+        let entry = entry(entry_settings.clone(), path.clone(), file_cache.clone()).await;
         write_stub_record(&entry, 1000000).await;
-        entry
-            .block_manager
-            .write()
-            .await
-            .unwrap()
-            .save_cache_on_disk()
-            .await
-            .unwrap();
+        entry.sync_fs().await.unwrap();
 
         let data_path = {
             let bm = entry.block_manager.read().await.unwrap();
-            let block_id = *bm.index().tree().first().unwrap();
+            let block_id = *bm.index().block_ids().first().unwrap();
             bm.path().join(format!("{}{}", block_id, DATA_FILE_EXT))
         };
-        FILE_CACHE.remove(&data_path).await.unwrap();
+        entry.file_cache.remove(&data_path).await.unwrap();
 
         let cfg = Cfg {
             role: InstanceRole::Replica,
@@ -299,6 +292,7 @@ mod tests {
             .settings(entry_settings)
             .cfg(Arc::new(cfg))
             .usage_counters(Default::default())
+            .file_cache(file_cache)
             .restore()
             .await
             .unwrap()
@@ -334,7 +328,8 @@ mod tests {
             let bm = entry.block_manager.read().await.unwrap();
             bm.path().join(format!("1000000{}", DATA_FILE_EXT))
         };
-        FILE_CACHE
+        entry
+            .file_cache
             .write_or_create(&data_path, std::io::SeekFrom::Start(0))
             .await
             .unwrap()
@@ -373,7 +368,7 @@ mod tests {
 
         {
             let mut bm = entry.block_manager.write().await.unwrap();
-            let _ = bm.find_block(1000000).await.unwrap();
+            let _ = bm.find_block_candidate(1000000).await.unwrap();
         }
 
         let mut reader = entry.begin_read(1000000).await.unwrap();
@@ -404,13 +399,14 @@ mod tests {
 
     #[rstest]
     #[tokio::test(flavor = "multi_thread")]
-    async fn test_search(path: PathBuf) {
+    async fn test_search(path: PathBuf, file_cache: Arc<FileCache>) {
         let entry = entry(
             EntrySettings {
                 max_block_size: 10000,
                 max_block_records: 5,
             },
             path,
+            file_cache,
         )
         .await;
 
@@ -425,8 +421,12 @@ mod tests {
 
     #[rstest]
     #[tokio::test(flavor = "multi_thread")]
-    async fn test_begin_read_when_entry_is_deleted(entry_settings: EntrySettings, path: PathBuf) {
-        let entry = entry(entry_settings.clone(), path.clone()).await;
+    async fn test_begin_read_when_entry_is_deleted(
+        entry_settings: EntrySettings,
+        path: PathBuf,
+        file_cache: Arc<FileCache>,
+    ) {
+        let entry = entry(entry_settings.clone(), path.clone(), file_cache).await;
         entry.mark_deleting().await.unwrap();
 
         let writer = entry.begin_read(1000).await;
@@ -438,8 +438,12 @@ mod tests {
 
     #[rstest]
     #[tokio::test(flavor = "multi_thread")]
-    async fn test_begin_read(entry_settings: EntrySettings, path: PathBuf) {
-        let entry = entry(entry_settings.clone(), path.clone()).await;
+    async fn test_begin_read(
+        entry_settings: EntrySettings,
+        path: PathBuf,
+        file_cache: Arc<FileCache>,
+    ) {
+        let entry = entry(entry_settings.clone(), path.clone(), file_cache).await;
 
         write_stub_record(&entry, 1000000).await;
         let mut reader = entry.begin_read(1000000).await.unwrap();

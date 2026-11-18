@@ -3,15 +3,16 @@
 mod read_only;
 use crate::cfg::Cfg;
 use crate::cfg::InstanceRole;
-use crate::core::file_cache::FILE_CACHE;
+use crate::core::file_cache::FileCache;
 use crate::core::sync::AsyncRwLock;
 use crate::core::weak::Weak;
 use crate::storage::bucket::Bucket;
 use crate::storage::folder_keeper::{DiscoveryDepth, FolderKeeper};
 use crate::storage::in_flight::InFlightIoLimiter;
 use crate::storage::usage::{BucketSnapshot, UsageCounters, UsageSnapshot};
-use log::{debug, error, info};
-use reduct_base::error::ReductError;
+use futures_util::future::try_join_all;
+use log::{debug, error, info, warn};
+use reduct_base::error::{ErrorCode, ReductError};
 use reduct_base::io::WriteRecord;
 use reduct_base::msg::bucket_api::BucketSettings;
 use reduct_base::msg::server_api::{BucketInfoList, Defaults, License, ServerInfo};
@@ -21,16 +22,22 @@ use reduct_base::{
 use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
+use tokio::sync::OwnedRwLockWriteGuard;
+use tokio::time::sleep;
 
 pub(crate) const MAX_IO_BUFFER_SIZE: usize = 1024 * 512;
 pub(crate) const CHANNEL_BUFFER_SIZE: usize = 16;
+const BUCKET_DELETION_MAX_ATTEMPTS: usize = 5;
+const BUCKET_DELETION_RETRY_BASE_DELAY: Duration = Duration::from_millis(20);
+const BUCKET_DELETION_RETRY_MAX_DELAY: Duration = Duration::from_millis(160);
 
 pub struct StorageEngineBuilder {
     cfg: Option<Cfg>,
     license: Option<License>,
     data_path: Option<PathBuf>,
     usage_counters: Option<Arc<UsageCounters>>,
+    file_cache: Option<Arc<FileCache>>,
 }
 
 impl StorageEngineBuilder {
@@ -57,6 +64,11 @@ impl StorageEngineBuilder {
         self
     }
 
+    pub(crate) fn with_file_cache(mut self, file_cache: Arc<FileCache>) -> Self {
+        self.file_cache = Some(file_cache);
+        self
+    }
+
     pub async fn build(self) -> StorageEngine {
         let cfg = self.cfg.expect("Config must be set");
         let data_path = self.data_path.expect("Data path must be set");
@@ -65,9 +77,16 @@ impl StorageEngineBuilder {
             .usage_counters
             .unwrap_or_else(|| Arc::new(UsageCounters::default()));
 
-        if !FILE_CACHE.try_exists(&data_path).await.unwrap_or(false) {
+        let file_cache = match self.file_cache {
+            Some(file_cache) => file_cache,
+            None => FileCache::with_local_backend(data_path.clone())
+                .await
+                .expect("Failed to initialize default storage backend"),
+        };
+
+        if !file_cache.try_exists(&data_path).await.unwrap_or(false) {
             info!("Folder {:?} doesn't exist. Create it.", data_path);
-            FILE_CACHE.create_dir_all(&data_path).await.unwrap();
+            file_cache.create_dir_all(&data_path).await.unwrap();
         }
 
         let data_path = data_path.canonicalize().unwrap();
@@ -75,8 +94,13 @@ impl StorageEngineBuilder {
         // restore buckets
         let time = Instant::now();
         let mut buckets = BTreeMap::new();
-        let folder_keeper =
-            FolderKeeper::new_with_depth(data_path.clone(), &cfg, DiscoveryDepth::FirstLevel).await;
+        let folder_keeper = FolderKeeper::new_with_depth(
+            data_path.clone(),
+            &cfg,
+            DiscoveryDepth::FirstLevel,
+            Arc::clone(&file_cache),
+        )
+        .await;
         for path in folder_keeper
             .list_folders()
             .await
@@ -87,6 +111,7 @@ impl StorageEngineBuilder {
                 .cfg(cfg.clone())
                 .io_limiter(io_limiter.clone())
                 .usage_counters(Arc::clone(&usage_counters))
+                .file_cache(Arc::clone(&file_cache))
                 .restore()
                 .await
             {
@@ -106,11 +131,12 @@ impl StorageEngineBuilder {
             data_path,
             start_time: Instant::now(),
             buckets: Arc::new(AsyncRwLock::new(buckets)),
-            license: self.license,
+            license: Arc::new(AsyncRwLock::new(self.license)),
             cfg,
             folder_keeper: Arc::new(folder_keeper),
             io_limiter,
             usage_counters,
+            file_cache,
         }
     }
 }
@@ -120,13 +146,14 @@ pub struct StorageEngine {
     data_path: PathBuf,
     start_time: Instant,
     buckets: Arc<AsyncRwLock<BTreeMap<String, Arc<Bucket>>>>,
-    license: Option<License>,
+    license: Arc<AsyncRwLock<Option<License>>>,
     cfg: Cfg,
     folder_keeper: Arc<FolderKeeper>,
     io_limiter: InFlightIoLimiter,
     /// Usage traffic counters owned by the engine and shared with the usage
     /// statistics logger, which drains them periodically.
     usage_counters: Arc<UsageCounters>,
+    pub(crate) file_cache: Arc<FileCache>,
 }
 
 #[derive(Copy, Clone, Eq, PartialEq)]
@@ -142,12 +169,17 @@ impl StorageEngine {
             license: None,
             data_path: None,
             usage_counters: None,
+            file_cache: None,
         }
     }
 
     #[cfg(test)]
     pub(crate) fn cfg(&self) -> &Cfg {
         &self.cfg
+    }
+
+    pub(crate) fn file_cache(&self) -> &Arc<FileCache> {
+        &self.file_cache
     }
 
     #[cfg(test)]
@@ -157,6 +189,12 @@ impl StorageEngine {
 
     async fn reload(&self) -> Result<(), ReductError> {
         // Replica reloading is driven by the launcher background task.
+        Ok(())
+    }
+
+    /// Update license information reported by the server at runtime.
+    pub async fn set_runtime_license(&self, license: License) -> Result<(), ReductError> {
+        *self.license.write().await? = Some(license);
         Ok(())
     }
 
@@ -183,14 +221,14 @@ impl StorageEngine {
         let mut oldest_record = u64::MAX;
         let mut latest_record = 0u64;
 
-        let buckets = self.buckets.read().await?;
-        let infos = buckets
-            .values()
-            .map(|bucket| bucket.clone().info())
-            .collect::<Vec<_>>();
+        let buckets_guard = self.buckets.read().await?;
+        let buckets = buckets_guard.values().cloned().collect::<Vec<_>>();
+        drop(buckets_guard);
+        let bucket_count = buckets.len() as u64;
+        let infos = try_join_all(buckets.into_iter().map(|bucket| bucket.info())).await?;
 
-        for task in infos {
-            let bucket = task.await?.info;
+        for info in infos {
+            let bucket = info.info;
             usage += bucket.size;
             if bucket.oldest_record != u64::MAX {
                 oldest_record = oldest_record.min(bucket.oldest_record);
@@ -204,7 +242,7 @@ impl StorageEngine {
                 .to_string(),
             instance_name: self.cfg.instance_name.clone(),
             instance_role: self.cfg.role.as_str().to_string(),
-            bucket_count: buckets.len() as u64,
+            bucket_count,
             usage,
             uptime: self.start_time.elapsed().as_secs(),
             oldest_record,
@@ -212,7 +250,7 @@ impl StorageEngine {
             defaults: Defaults {
                 bucket: self.cfg.bucket_defaults.clone(),
             },
-            license: self.license.clone(),
+            license: self.license.read().await?.clone(),
         })
     }
 
@@ -358,6 +396,7 @@ impl StorageEngine {
                 .cfg(self.cfg.clone())
                 .io_limiter(self.io_limiter.clone())
                 .usage_counters(Arc::clone(&self.usage_counters))
+                .file_cache(Arc::clone(&self.file_cache))
                 .build()
                 .await?,
         );
@@ -383,9 +422,7 @@ impl StorageEngine {
                 bucket.ensure_not_deleting().await?;
                 Ok(Arc::clone(bucket).into())
             }
-            None => Err(ReductError::not_found(
-                format!("Bucket '{}' is not found", name).as_str(),
-            )),
+            None => Err(not_found!("Bucket '{}' is not found", name)),
         }
     }
 
@@ -401,9 +438,8 @@ impl StorageEngine {
     pub(crate) async fn remove_bucket(&self, name: &str) -> Result<(), ReductError> {
         self.check_mode()?;
 
-        let buckets = self.buckets.clone();
         let bucket = {
-            let buckets = buckets.read().await?;
+            let buckets = self.buckets.read().await?;
             buckets
                 .get(name)
                 .cloned()
@@ -417,28 +453,100 @@ impl StorageEngine {
             ));
         }
 
-        bucket.mark_deleting().await?;
+        let worker_buckets = Arc::clone(&self.buckets);
+        let folder_keeper = Arc::clone(&self.folder_keeper);
+        bucket
+            .admit_deletion(&self.buckets, name, move |bucket, admission| {
+                tokio::spawn(Self::run_bucket_deletion(
+                    bucket,
+                    Arc::clone(&worker_buckets),
+                    Arc::clone(&folder_keeper),
+                    admission,
+                ))
+            })
+            .await
+    }
 
-        let path = self.data_path.join(name);
-        let name = name.to_string();
-        let folder_keeper = self.folder_keeper.clone();
-        let bucket = Arc::clone(&bucket);
+    async fn run_bucket_deletion(
+        bucket: Arc<Bucket>,
+        buckets: Arc<AsyncRwLock<BTreeMap<String, Arc<Bucket>>>>,
+        folder_keeper: Arc<FolderKeeper>,
+        _maintenance_admission: OwnedRwLockWriteGuard<()>,
+    ) -> Result<(), ReductError> {
+        let mut retry_delay = BUCKET_DELETION_RETRY_BASE_DELAY;
 
-        let _ = tokio::spawn(async move {
-            let remove_bucket_from_backend = async || {
-                bucket.remove_entries_for_bucket_removal().await?;
-                folder_keeper.remove_folder(&name).await?;
-                debug!("Bucket '{}' and folder {:?} are removed", name, path);
-                let mut buckets = buckets.write().await?;
-                buckets.remove(&name);
-                Ok::<(), ReductError>(())
+        for attempt in 1..=BUCKET_DELETION_MAX_ATTEMPTS {
+            #[cfg(test)]
+            let attempt_result = {
+                let injected =
+                    if let Some(hook) = bucket.deletion_attempt_hook.read().await?.clone() {
+                        hook(attempt).await
+                    } else {
+                        Ok(())
+                    };
+                match injected {
+                    Ok(()) => Self::remove_bucket_once(&bucket, &buckets, &folder_keeper).await,
+                    Err(err) => Err(err),
+                }
             };
+            #[cfg(not(test))]
+            let attempt_result = Self::remove_bucket_once(&bucket, &buckets, &folder_keeper).await;
 
-            if let Err(err) = remove_bucket_from_backend().await {
-                error!("Failed to sync bucket '{}': {}", name, err);
+            match attempt_result {
+                Ok(()) => {
+                    debug!("Bucket '{}' deletion finished", bucket.name());
+                    return Ok(());
+                }
+                Err(err)
+                    if attempt < BUCKET_DELETION_MAX_ATTEMPTS
+                        && is_retryable_bucket_deletion_error(&err) =>
+                {
+                    warn!(
+                        "Failed to delete bucket '{}' on attempt {}/{}; retrying in {:?}: {}",
+                        bucket.name(),
+                        attempt,
+                        BUCKET_DELETION_MAX_ATTEMPTS,
+                        retry_delay,
+                        err
+                    );
+                    sleep(retry_delay).await;
+                    retry_delay = (retry_delay * 2).min(BUCKET_DELETION_RETRY_MAX_DELAY);
+                }
+                Err(err) => {
+                    error!(
+                        "Failed to delete bucket '{}' on attempt {}/{}; the bucket remains DELETING and a repeated DELETE can resume cleanup: {}",
+                        bucket.name(),
+                        attempt,
+                        BUCKET_DELETION_MAX_ATTEMPTS,
+                        err
+                    );
+                    return Err(err);
+                }
             }
-        });
+        }
 
+        unreachable!("bucket deletion loop must return on the final attempt")
+    }
+
+    async fn remove_bucket_once(
+        bucket: &Arc<Bucket>,
+        buckets: &Arc<AsyncRwLock<BTreeMap<String, Arc<Bucket>>>>,
+        folder_keeper: &Arc<FolderKeeper>,
+    ) -> Result<(), ReductError> {
+        let name = bucket.name().to_string();
+        let path = bucket.path().clone();
+
+        bucket.remove_entries_for_bucket_removal().await?;
+        folder_keeper.remove_folder(&name).await?;
+        debug!("Bucket '{}' and folder {:?} are removed", name, path);
+
+        let mut buckets = buckets.write().await?;
+        if buckets
+            .get(&name)
+            .is_some_and(|current| Arc::ptr_eq(current, bucket))
+        {
+            buckets.remove(&name);
+        }
         Ok(())
     }
 
@@ -484,6 +592,7 @@ impl StorageEngine {
             .cfg(cfg)
             .io_limiter(self.io_limiter.clone())
             .usage_counters(Arc::clone(&self.usage_counters))
+            .file_cache(Arc::clone(&self.file_cache))
             .restore()
             .await?;
         buckets.insert(new_name.to_string(), Arc::new(bucket));
@@ -520,7 +629,7 @@ impl StorageEngine {
     pub async fn sync_fs(&self) -> Result<(), ReductError> {
         self.run_bucket_maintenance(BucketMaintenanceMode::SyncFs)
             .await?;
-        FILE_CACHE.force_sync_all().await?;
+        self.file_cache.force_sync_all().await?;
         Ok(())
     }
 
@@ -572,10 +681,11 @@ impl StorageEngine {
     }
 }
 
-pub(super) fn check_name_convention(name: &str) -> Result<(), ReductError> {
-    static NAME_REGEX: std::sync::LazyLock<regex::Regex> =
-        std::sync::LazyLock::new(|| regex::Regex::new(r"^[A-Za-z0-9_-]*$").unwrap());
-    if !NAME_REGEX.is_match(name) {
+static NAME_CONVENTION_REGEX: std::sync::LazyLock<regex::Regex> =
+    std::sync::LazyLock::new(|| regex::Regex::new(r"^[A-Za-z0-9_-]*$").unwrap());
+
+pub(crate) fn check_name_convention(name: &str) -> Result<(), ReductError> {
+    if !NAME_CONVENTION_REGEX.is_match(name) {
         return Err(unprocessable_entity!(
             "Bucket or entry name can contain only letters, digests and [-,_] symbols",
         ));
@@ -613,6 +723,13 @@ pub(super) fn check_entry_name_convention(name: &str) -> Result<(), ReductError>
     Err(unprocessable_entity!(
         "Entry name can contain only letters, digits and [-,_,/] symbols or end with '/$meta'",
     ))
+}
+
+fn is_retryable_bucket_deletion_error(err: &ReductError) -> bool {
+    matches!(
+        err.status(),
+        ErrorCode::ConnectionError | ErrorCode::Timeout | ErrorCode::TooManyRequests
+    ) || (err.status() as i16) >= 500
 }
 
 #[cfg(test)]
@@ -839,6 +956,24 @@ mod tests {
                 .await,
         );
         assert_eq!(storage.info().await.unwrap().license, Some(license));
+
+        let subscription_license = License {
+            licensee: "Subscription".to_string(),
+            invoice: "lic-123".to_string(),
+            expiry_date: chrono::Utc::now(),
+            plan: "Unlimited".to_string(),
+            device_number: 0,
+            disk_quota: 0,
+            fingerprint: String::new(),
+        };
+        storage
+            .set_runtime_license(subscription_license.clone())
+            .await
+            .unwrap();
+        assert_eq!(
+            storage.info().await.unwrap().license,
+            Some(subscription_license)
+        );
     }
 
     #[rstest]
@@ -1115,7 +1250,7 @@ mod tests {
 
             let path = storage.data_path.join("test");
             let settings_path = path.join(SETTINGS_NAME);
-            FILE_CACHE.remove(&settings_path).await.unwrap();
+            storage.file_cache().remove(&settings_path).await.unwrap();
             let cfg = Cfg {
                 data_path: storage.data_path.clone(),
                 ..Cfg::default()
@@ -1324,6 +1459,55 @@ mod tests {
 
     mod remove_bucket {
         use super::*;
+        use crate::storage::bucket::DeletionAttemptHook;
+        use reduct_base::msg::status::ResourceStatus;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::sync::Notify;
+        use tokio::time::timeout;
+
+        async fn wait_for_bucket_removal(storage: &Arc<StorageEngine>, name: &str) {
+            timeout(Duration::from_secs(5), async {
+                while storage.buckets.read().await.unwrap().contains_key(name) {
+                    sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("bucket was not removed");
+        }
+
+        async fn wait_for_finished_deletion(bucket: &Arc<Bucket>) {
+            timeout(Duration::from_secs(5), async {
+                while !bucket.has_finished_deletion_task().await {
+                    sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("deletion worker did not finish");
+        }
+
+        async fn write_test_record(
+            storage: &Arc<StorageEngine>,
+            entry: &str,
+            time: u64,
+            content: &'static [u8],
+        ) {
+            let mut writer = storage
+                .begin_write(
+                    "test",
+                    entry,
+                    time,
+                    content.len() as u64,
+                    "text/plain".to_string(),
+                    Labels::new(),
+                )
+                .await
+                .unwrap();
+            writer
+                .send(Ok(Some(Bytes::from_static(content))))
+                .await
+                .unwrap();
+            writer.send(Ok(None)).await.unwrap();
+        }
 
         #[rstest]
         #[tokio::test]
@@ -1339,12 +1523,10 @@ mod tests {
             let result = storage.remove_bucket("test").await;
             assert_eq!(result, Ok(()));
 
-            let result = storage.get_bucket("test").await;
-            let err = result.err().unwrap();
-            assert!(
-                err == conflict!("Bucket 'test' is being deleted")
-                    || err == not_found!("Bucket 'test' is not found"),
-                "Bucket should be deleting or removed"
+            wait_for_bucket_removal(&storage, "test").await;
+            assert_eq!(
+                storage.remove_bucket("test").await,
+                Err(not_found!("Bucket 'test' is not found"))
             );
         }
 
@@ -1358,7 +1540,7 @@ mod tests {
 
         #[rstest]
         #[tokio::test]
-        async fn remove_bucket_returns_conflict_when_bucket_is_already_deleting(
+        async fn remove_bucket_returns_ok_when_bucket_is_already_deleting(
             #[future] storage: Arc<StorageEngine>,
         ) {
             let storage = storage.await;
@@ -1378,10 +1560,8 @@ mod tests {
                 .clone();
             bucket.mark_deleting().await.unwrap();
 
-            assert_eq!(
-                storage.remove_bucket("test").await,
-                Err(conflict!("Bucket 'test' is being deleted"))
-            );
+            assert_eq!(storage.remove_bucket("test").await, Ok(()));
+            wait_for_bucket_removal(&storage, "test").await;
         }
 
         #[rstest]
@@ -1397,6 +1577,7 @@ mod tests {
 
             let result = storage.remove_bucket("test").await;
             assert_eq!(result, Ok(()));
+            wait_for_bucket_removal(&storage, "test").await;
 
             let storage = Arc::new(
                 StorageEngine::builder()
@@ -1408,6 +1589,222 @@ mod tests {
 
             let result = storage.get_bucket("test").await;
             assert_eq!(result.err(), Some(not_found!("Bucket 'test' is not found")));
+        }
+
+        #[rstest]
+        #[tokio::test(flavor = "multi_thread")]
+        async fn concurrent_remove_bucket_requests_start_one_worker(
+            #[future] storage: Arc<StorageEngine>,
+        ) {
+            let storage = storage.await;
+            let bucket = storage
+                .create_bucket("test", BucketSettings::default())
+                .await
+                .unwrap()
+                .upgrade_and_unwrap();
+
+            let attempts = Arc::new(AtomicUsize::new(0));
+            let release = Arc::new(Notify::new());
+            let hook_attempts = Arc::clone(&attempts);
+            let hook_release = Arc::clone(&release);
+            let hook: DeletionAttemptHook = Arc::new(
+                move |attempt| -> futures_util::future::BoxFuture<'static, Result<(), ReductError>> {
+                    let attempts = Arc::clone(&hook_attempts);
+                    let release = Arc::clone(&hook_release);
+                    Box::pin(async move {
+                        attempts.fetch_add(1, Ordering::SeqCst);
+                        if attempt == 1 {
+                            release.notified().await;
+                        }
+                        Ok(())
+                    })
+                },
+            );
+            bucket.set_deletion_attempt_hook(Some(hook)).await;
+
+            let (first, second) =
+                tokio::join!(storage.remove_bucket("test"), storage.remove_bucket("test"));
+            assert_eq!(first, Ok(()));
+            assert_eq!(second, Ok(()));
+
+            release.notify_one();
+            wait_for_bucket_removal(&storage, "test").await;
+            assert_eq!(attempts.load(Ordering::SeqCst), 1);
+        }
+
+        #[rstest]
+        #[tokio::test]
+        async fn remove_bucket_completes_when_entry_is_already_deleting(
+            #[future] storage: Arc<StorageEngine>,
+        ) {
+            let storage = storage.await;
+            let bucket = storage
+                .create_bucket("test", BucketSettings::default())
+                .await
+                .unwrap()
+                .upgrade_and_unwrap();
+            write_test_record(&storage, "entry", 1, b"data").await;
+            let entry = bucket.get_entry("entry").await.unwrap().upgrade().unwrap();
+            entry.mark_deleting().await.unwrap();
+
+            assert_eq!(storage.remove_bucket("test").await, Ok(()));
+            wait_for_bucket_removal(&storage, "test").await;
+        }
+
+        #[rstest]
+        #[tokio::test]
+        async fn remove_bucket_retries_transient_failure(#[future] storage: Arc<StorageEngine>) {
+            let storage = storage.await;
+            let bucket = storage
+                .create_bucket("test", BucketSettings::default())
+                .await
+                .unwrap()
+                .upgrade_and_unwrap();
+
+            let attempts = Arc::new(AtomicUsize::new(0));
+            let hook_attempts = Arc::clone(&attempts);
+            let hook: DeletionAttemptHook = Arc::new(
+                move |attempt| -> futures_util::future::BoxFuture<'static, Result<(), ReductError>> {
+                    let attempts = Arc::clone(&hook_attempts);
+                    Box::pin(async move {
+                        attempts.fetch_add(1, Ordering::SeqCst);
+                        if attempt == 1 {
+                            Err(internal_server_error!("injected transient deletion failure"))
+                        } else {
+                            Ok(())
+                        }
+                    })
+                },
+            );
+            bucket.set_deletion_attempt_hook(Some(hook)).await;
+
+            assert_eq!(storage.remove_bucket("test").await, Ok(()));
+            wait_for_bucket_removal(&storage, "test").await;
+            assert_eq!(attempts.load(Ordering::SeqCst), 2);
+        }
+
+        #[rstest]
+        #[tokio::test]
+        async fn remove_bucket_repeated_delete_resumes_after_retry_exhaustion(
+            #[future] storage: Arc<StorageEngine>,
+        ) {
+            let storage = storage.await;
+            let bucket = storage
+                .create_bucket("test", BucketSettings::default())
+                .await
+                .unwrap()
+                .upgrade_and_unwrap();
+
+            let attempts = Arc::new(AtomicUsize::new(0));
+            let failures = Arc::new(AtomicUsize::new(BUCKET_DELETION_MAX_ATTEMPTS));
+            let hook_attempts = Arc::clone(&attempts);
+            let hook_failures = Arc::clone(&failures);
+            let hook: DeletionAttemptHook = Arc::new(
+                move |attempt| -> futures_util::future::BoxFuture<'static, Result<(), ReductError>> {
+                    let attempts = Arc::clone(&hook_attempts);
+                    let failures = Arc::clone(&hook_failures);
+                    Box::pin(async move {
+                        attempts.fetch_add(1, Ordering::SeqCst);
+                        if attempt <= failures.load(Ordering::SeqCst) {
+                            Err(internal_server_error!("injected transient deletion failure"))
+                        } else {
+                            Ok(())
+                        }
+                    })
+                },
+            );
+            bucket.set_deletion_attempt_hook(Some(hook)).await;
+
+            assert_eq!(storage.remove_bucket("test").await, Ok(()));
+            wait_for_finished_deletion(&bucket).await;
+            assert_eq!(bucket.status().await.unwrap(), ResourceStatus::Deleting);
+            assert!(storage.buckets.read().await.unwrap().contains_key("test"));
+
+            failures.store(0, Ordering::SeqCst);
+            assert_eq!(storage.remove_bucket("test").await, Ok(()));
+            wait_for_bucket_removal(&storage, "test").await;
+            assert_eq!(
+                attempts.load(Ordering::SeqCst),
+                BUCKET_DELETION_MAX_ATTEMPTS + 1
+            );
+        }
+
+        #[rstest]
+        #[tokio::test]
+        async fn remove_bucket_repeated_delete_restarts_panicked_worker(
+            #[future] storage: Arc<StorageEngine>,
+        ) {
+            let storage = storage.await;
+            let bucket = storage
+                .create_bucket("test", BucketSettings::default())
+                .await
+                .unwrap()
+                .upgrade_and_unwrap();
+
+            let hook: DeletionAttemptHook = Arc::new(
+                move |_attempt| -> futures_util::future::BoxFuture<'static, Result<(), ReductError>> {
+                    Box::pin(async move {
+                        panic!("injected deletion worker panic");
+                    })
+                },
+            );
+            bucket.set_deletion_attempt_hook(Some(hook)).await;
+
+            assert_eq!(storage.remove_bucket("test").await, Ok(()));
+            wait_for_finished_deletion(&bucket).await;
+            assert_eq!(bucket.status().await.unwrap(), ResourceStatus::Deleting);
+            assert!(storage.buckets.read().await.unwrap().contains_key("test"));
+
+            bucket.set_deletion_attempt_hook(None).await;
+            assert_eq!(storage.remove_bucket("test").await, Ok(()));
+            wait_for_bucket_removal(&storage, "test").await;
+        }
+
+        #[rstest]
+        #[tokio::test]
+        async fn remove_bucket_does_not_delete_replacement_bucket_with_same_name(
+            #[future] storage: Arc<StorageEngine>,
+        ) {
+            let storage = storage.await;
+            let old_bucket = storage
+                .create_bucket("test", BucketSettings::default())
+                .await
+                .unwrap()
+                .upgrade_and_unwrap();
+
+            assert_eq!(storage.remove_bucket("test").await, Ok(()));
+            wait_for_bucket_removal(&storage, "test").await;
+
+            let new_bucket = storage
+                .create_bucket("test", BucketSettings::default())
+                .await
+                .unwrap()
+                .upgrade_and_unwrap();
+
+            let spawned = Arc::new(AtomicUsize::new(0));
+            let delayed_request = old_bucket.admit_deletion(&storage.buckets, "test", {
+                let spawned = Arc::clone(&spawned);
+                move |_bucket, admission| {
+                    spawned.fetch_add(1, Ordering::SeqCst);
+                    tokio::spawn(async move {
+                        drop(admission);
+                        Ok::<(), ReductError>(())
+                    })
+                }
+            });
+            delayed_request.await.unwrap();
+
+            assert_eq!(spawned.load(Ordering::SeqCst), 0);
+            let current_bucket = storage
+                .buckets
+                .read()
+                .await
+                .unwrap()
+                .get("test")
+                .unwrap()
+                .clone();
+            assert!(Arc::ptr_eq(&current_bucket, &new_bucket));
+            assert_eq!(new_bucket.status().await.unwrap(), ResourceStatus::Ready);
         }
     }
 

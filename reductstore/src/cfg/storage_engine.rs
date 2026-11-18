@@ -12,11 +12,14 @@ pub struct StorageEngineConfig {
     pub replica_update_interval: Duration,
     pub enable_integrity_checks: bool,
     pub max_storage_size: Option<u64>,
+    /// Disk space limit in bytes for decompressed copies of compressed blocks, shared by all entries.
+    pub decompress_cache_size: u64,
     pub free_space_check_interval: Duration,
 }
 
 const DEFAULT_COMPACTION_INTERVAL_SECS: u64 = 60;
 const DEFAULT_REPLICA_UPDATE_INTERVAL_SECS: u64 = 60;
+const DEFAULT_DECOMPRESS_CACHE_SIZE: u64 = 1_000_000_000;
 
 impl Default for StorageEngineConfig {
     fn default() -> Self {
@@ -25,6 +28,7 @@ impl Default for StorageEngineConfig {
             replica_update_interval: Duration::from_secs(DEFAULT_REPLICA_UPDATE_INTERVAL_SECS),
             enable_integrity_checks: true,
             max_storage_size: None,
+            decompress_cache_size: DEFAULT_DECOMPRESS_CACHE_SIZE,
             free_space_check_interval: Duration::ZERO,
         }
     }
@@ -47,6 +51,10 @@ impl<EnvGetter: GetEnv, ExtCfg: ExtCfgBounds> CfgParser<EnvGetter, ExtCfg> {
             max_storage_size: env
                 .get_optional::<ByteSize>("RS_ENGINE_MAX_STORAGE_SIZE")
                 .map(|size| size.as_u64()),
+            decompress_cache_size: env
+                .get_optional::<ByteSize>("RS_ENGINE_DECOMPRESS_CACHE_SIZE")
+                .map(|size| size.as_u64())
+                .unwrap_or(DEFAULT_DECOMPRESS_CACHE_SIZE),
             free_space_check_interval: Duration::from_millis(
                 env.get_optional::<u64>("RS_FS_FREE_SPACE_CHECK_INTERVAL_MS")
                     .unwrap_or(0),
@@ -85,6 +93,10 @@ mod tests {
             .return_const(Ok("10GB".to_string()));
         env_getter
             .expect_get()
+            .with(eq("RS_ENGINE_DECOMPRESS_CACHE_SIZE"))
+            .return_const(Ok("2GB".to_string()));
+        env_getter
+            .expect_get()
             .with(eq("RS_FS_FREE_SPACE_CHECK_INTERVAL_MS"))
             .return_const(Ok("250".to_string()));
 
@@ -93,6 +105,7 @@ mod tests {
             replica_update_interval: Duration::from_secs(45),
             enable_integrity_checks: false,
             max_storage_size: Some(10_000_000_000),
+            decompress_cache_size: 2_000_000_000,
             free_space_check_interval: Duration::from_millis(250),
         };
 

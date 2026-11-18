@@ -466,10 +466,15 @@ pub(crate) mod tests {
         let cfg = Cfg {
             data_path: tempfile::tempdir().unwrap().keep(),
             api_token: crate::cfg::ApiToken::Provisioned("init-token".to_string()),
-            role: InstanceRole::Replica,
             ..Cfg::default()
         };
-        let keeper = keeper_with_cfg(cfg).await;
+        // A replica attaches to a data folder that a primary has initialized.
+        drop(keeper_with_cfg(cfg.clone()).await);
+        let keeper = keeper_with_cfg(Cfg {
+            role: InstanceRole::Replica,
+            ..cfg
+        })
+        .await;
         let err = run_ingest_benchmark(
             State(keeper),
             headers,

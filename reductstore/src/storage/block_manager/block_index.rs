@@ -6,27 +6,63 @@ use crc64fast::Digest;
 use prost::Message;
 use reduct_base::error::ReductError;
 use reduct_base::internal_server_error;
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io::{Read, SeekFrom, Write};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
 
 use crate::backend::file::File;
-use crate::core::file_cache::FILE_CACHE;
+use crate::core::file_cache::{BatchToken, FileCache};
 use crate::storage::block_manager::block::Block;
 use crate::storage::block_manager::{COMPRESSED_DESCRIPTOR_FILE_EXT, DESCRIPTOR_FILE_EXT};
 use crate::storage::proto::block_index::Block as BlockEntry;
 use crate::storage::proto::{
     ts_to_us, us_to_ts, Block as BlockProto, BlockIndex as BlockIndexProto, MinimalBlock,
 };
+use std::sync::Arc;
 
-#[derive(Debug)]
+type BlockId = u64;
+type Timestamp = u64;
+type LastRecordIndex = BTreeMap<BlockId, Timestamp>;
+
 pub(in crate::storage) struct BlockIndex {
     path_buf: PathBuf,
-    index_info: HashMap<u64, BlockEntry>,
-    index: BTreeSet<u64>,
+    index_info: HashMap<BlockId, BlockEntry>,
+    index: BTreeSet<BlockId>,
+    batch_token: Option<BatchToken>,
+    file_cache: Arc<FileCache>,
+    crc64: AtomicU64,
+    last_record_index: LastRecordIndex,
     total_size: Arc<AtomicU64>,
+}
+
+fn adjust_size(counter: &AtomicU64, before: u64, after: u64) {
+    if after >= before {
+        counter.fetch_add(after - before, Ordering::AcqRel);
+    } else {
+        counter.fetch_sub(before - after, Ordering::AcqRel);
+    }
+}
+
+impl std::fmt::Debug for BlockIndex {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BlockIndex")
+            .field("path_buf", &self.path_buf)
+            .field("index_info", &self.index_info)
+            .field("index", &self.index)
+            .field("batch_token", &self.batch_token)
+            .field("crc64", &self.crc64.load(Ordering::Acquire))
+            .finish()
+    }
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(in crate::storage) struct BlockIndexSummary {
+    pub size: u64,
+    pub record_count: u64,
+    pub block_count: u64,
+    pub oldest_record: u64,
+    pub latest_record: u64,
 }
 
 impl Into<BlockEntry> for MinimalBlock {
@@ -84,13 +120,27 @@ impl From<Block> for BlockEntry {
 }
 
 impl BlockIndex {
-    pub fn new(path_buf: PathBuf) -> Self {
-        BlockIndex {
+    pub fn new(path_buf: PathBuf, file_cache: Arc<FileCache>) -> Self {
+        let index = BlockIndex {
             path_buf,
             index_info: HashMap::new(),
             index: BTreeSet::new(),
+            batch_token: None,
+            file_cache,
+            crc64: AtomicU64::new(0),
+            last_record_index: BTreeMap::new(),
             total_size: Arc::new(AtomicU64::new(0)),
-        }
+        };
+
+        index
+    }
+
+    pub(crate) fn set_batch_token(&mut self, token: BatchToken) {
+        self.batch_token = Some(token);
+    }
+
+    pub(crate) fn clear_batch_token(&mut self) {
+        self.batch_token = None;
     }
 
     /// Insert  or update a new block entry into the index.
@@ -139,16 +189,17 @@ impl BlockIndex {
         let before = block.size + block.metadata_size;
         update(block);
         let after = block.size + block.metadata_size;
-        self.adjust_total_size(before, after);
+        adjust_size(&self.total_size, before, after);
         true
     }
 
     pub fn remove_block(&mut self, block_id: u64) -> Option<BlockEntry> {
         let block = self.index_info.remove(&block_id);
         self.index.remove(&block_id);
+        self.last_record_index.remove(&block_id);
 
         if let Some(block) = &block {
-            self.adjust_total_size(block.size + block.metadata_size, 0);
+            adjust_size(&self.total_size, block.size + block.metadata_size, 0);
         }
 
         block
@@ -210,12 +261,12 @@ impl BlockIndex {
             .collect()
     }
 
-    pub async fn try_load(path: PathBuf) -> Result<Self, ReductError> {
-        if !FILE_CACHE.try_exists(&path).await? {
+    pub async fn try_load(path: PathBuf, file_cache: Arc<FileCache>) -> Result<Self, ReductError> {
+        if !file_cache.try_exists(&path).await? {
             return Err(internal_server_error!("Block index {:?} not found", path));
         }
 
-        let mut lock = FILE_CACHE.read(&path, SeekFrom::Start(0)).await?;
+        let mut lock = file_cache.read(&path, SeekFrom::Start(0)).await?;
         let mut buf = Vec::new();
         if let Err(err) = lock.read_to_end(&mut buf) {
             return Err(internal_server_error!(
@@ -228,7 +279,7 @@ impl BlockIndex {
         if lock.metadata()?.len() == 0 {
             // If the index file is empty, check if there are any block descriptors.
             // If there are, the index file is corrupted.
-            let has_block_descriptors = FILE_CACHE
+            let has_block_descriptors = file_cache
                 .read_dir(&path.parent().unwrap().into())
                 .await?
                 .iter()
@@ -246,12 +297,26 @@ impl BlockIndex {
             internal_server_error!("Failed to decode block index {:?}: {}", path, err)
         })?;
 
-        let block_index: BlockIndex = BlockIndex::from_proto(path, block_index_proto)?;
+        let block_index: BlockIndex = BlockIndex::from_proto(path, block_index_proto, file_cache)?;
         Ok(block_index)
     }
 
-    pub fn from_proto(path: PathBuf, value: BlockIndexProto) -> Result<Self, ReductError> {
-        let mut block_index = BlockIndex::new(path.clone());
+    pub fn from_proto(
+        path: PathBuf,
+        value: BlockIndexProto,
+        file_cache: Arc<FileCache>,
+    ) -> Result<Self, ReductError> {
+        let expected_crc64 = value.crc64;
+        let mut block_index = BlockIndex {
+            path_buf: path.clone(),
+            index_info: HashMap::new(),
+            index: BTreeSet::new(),
+            batch_token: None,
+            file_cache,
+            crc64: AtomicU64::new(expected_crc64),
+            last_record_index: BTreeMap::new(),
+            total_size: Arc::new(AtomicU64::new(0)),
+        };
 
         let mut crc = Digest::new();
         value.blocks.into_iter().for_each(|block| {
@@ -278,7 +343,7 @@ impl BlockIndex {
             block_index.insert(block);
         });
 
-        if crc.sum64() != value.crc64 {
+        if crc.sum64() != expected_crc64 {
             return Err(internal_server_error!(
                 "Block index {:?} is corrupted",
                 path
@@ -336,9 +401,18 @@ impl BlockIndex {
         block_index_proto.crc64 = crc.sum64();
         let buf = block_index_proto.encode_to_vec();
 
-        let mut lock = FILE_CACHE
-            .write_or_create(&self.path_buf, SeekFrom::Start(0))
-            .await?;
+        let mut lock = match &self.batch_token {
+            Some(token) => {
+                self.file_cache
+                    .write_or_create_in_batch(token, &self.path_buf, SeekFrom::Start(0))
+                    .await?
+            }
+            None => {
+                self.file_cache
+                    .write_or_create(&self.path_buf, SeekFrom::Start(0))
+                    .await?
+            }
+        };
         File::run_blocking_io(|| {
             lock.set_len(0)?;
             lock.write_all(&buf)
@@ -348,6 +422,7 @@ impl BlockIndex {
         })?;
 
         lock.flush_local().await?;
+        self.crc64.store(block_index_proto.crc64, Ordering::Release);
 
         Ok(())
     }
@@ -375,24 +450,69 @@ impl BlockIndex {
             .fold(0, |acc, (_, block)| acc + block.record_count)
     }
 
-    pub fn tree(&self) -> &BTreeSet<u64> {
+    pub fn aggregate_stats(&self) -> BlockIndexSummary {
+        let (size, record_count) =
+            self.index_info
+                .values()
+                .fold((0, 0), |(size, record_count), block| {
+                    (
+                        size + block.size + block.metadata_size,
+                        record_count + block.record_count,
+                    )
+                });
+        let oldest_record = self
+            .index
+            .iter()
+            .find_map(|block_id| {
+                let block = self.get_block(*block_id)?;
+                (!self.is_corrupted(*block_id) && block.record_count > 0).then_some(*block_id)
+            })
+            .unwrap_or(0);
+        let latest_record = self
+            .index
+            .iter()
+            .rev()
+            .find_map(|block_id| {
+                let block = self.get_block(*block_id)?;
+                (!self.is_corrupted(*block_id) && block.record_count > 0)
+                    .then(|| ts_to_us(block.latest_record_time.as_ref().unwrap()))
+            })
+            .unwrap_or(0);
+
+        BlockIndexSummary {
+            size,
+            record_count,
+            block_count: self.index.len() as u64,
+            oldest_record,
+            latest_record,
+        }
+    }
+
+    pub fn block_ids(&self) -> &BTreeSet<u64> {
         &self.index
+    }
+
+    pub fn last_record_index(&self) -> &BTreeMap<u64, u64> {
+        &self.last_record_index
+    }
+
+    pub fn update_latest_record_time(&mut self, block_id: u64, time: u64) {
+        // This is a lookup bound, not persisted metadata; the descriptor and index
+        // are written together later by save_meta_on_disk.
+        self.last_record_index.insert(block_id, time);
     }
 
     pub fn info(&self) -> &HashMap<u64, BlockEntry> {
         &self.index_info
     }
 
-    pub async fn sync_all(&mut self) -> Result<(), ReductError> {
-        let mut lock = FILE_CACHE
-            .write_or_create(&self.path_buf, SeekFrom::Start(0))
-            .await?;
-        lock.sync_all().await?;
-        Ok(())
+    pub(in crate::storage) fn crc64(&self) -> u64 {
+        self.crc64.load(Ordering::Acquire)
     }
 
     fn insert(&mut self, mut block: BlockEntry) {
         let block_id = block.block_id;
+        let latest = ts_to_us(block.latest_record_time.as_ref().unwrap());
         let added = block.size + block.metadata_size;
         if block.version.is_none() {
             block.version = self.index_info.get(&block_id).and_then(|prev| prev.version);
@@ -402,15 +522,8 @@ impl BlockIndex {
             .insert(block_id, block)
             .map_or(0, |previous| previous.size + previous.metadata_size);
         self.index.insert(block_id);
-        self.adjust_total_size(removed, added);
-    }
-
-    fn adjust_total_size(&self, before: u64, after: u64) {
-        if after >= before {
-            self.total_size.fetch_add(after - before, Ordering::AcqRel);
-        } else {
-            self.total_size.fetch_sub(before - after, Ordering::AcqRel);
-        }
+        self.last_record_index.insert(block_id, latest);
+        adjust_size(&self.total_size, removed, added);
     }
 
     fn fold_size(&self) -> u64 {
@@ -423,14 +536,54 @@ impl BlockIndex {
 #[cfg(test)]
 mod tests {
     use std::fs;
+    use std::sync::Arc;
 
+    use crate::core::file_cache::{build_test_file_cache, FileCache};
     use crate::storage::block_manager::BLOCK_INDEX_FILE;
     use crate::storage::proto::block_index::Block as BlockEntry;
     use prost_wkt_types::Timestamp;
-    use rstest::rstest;
+    use rstest::{fixture, rstest};
     use tempfile::tempdir;
 
     use super::*;
+
+    #[fixture]
+    fn file_cache() -> Arc<FileCache> {
+        build_test_file_cache()
+    }
+
+    #[tokio::test]
+    async fn lookup_bound_tracks_blocks_without_changing_persisted_metadata() {
+        let mut index = BlockIndex::new(PathBuf::from("index"), build_test_file_cache());
+        index.insert_or_update(BlockEntry {
+            block_id: 10,
+            latest_record_time: Some(us_to_ts(&10)),
+            ..Default::default()
+        });
+        assert_eq!(index.last_record_index().get(&10), Some(&10));
+
+        index.update_latest_record_time(10, 40);
+        assert_eq!(index.last_record_index().get(&10), Some(&40));
+        assert_eq!(
+            index
+                .get_block(10)
+                .unwrap()
+                .latest_record_time
+                .as_ref()
+                .map(ts_to_us),
+            Some(10)
+        );
+
+        index.insert_or_update(BlockEntry {
+            block_id: 10,
+            latest_record_time: Some(us_to_ts(&20)),
+            ..Default::default()
+        });
+        assert_eq!(index.last_record_index().get(&10), Some(&20));
+
+        index.remove_block(10);
+        assert!(!index.last_record_index().contains_key(&10));
+    }
 
     mod size_counter {
         use super::*;
@@ -458,8 +611,9 @@ mod tests {
         }
 
         #[rstest]
-        fn tracks_insert_update_remove() {
-            let mut index = BlockIndex::new(PathBuf::from("unused"));
+        #[tokio::test]
+        async fn tracks_insert_update_remove(file_cache: Arc<FileCache>) {
+            let mut index = BlockIndex::new(PathBuf::from("unused"), file_cache);
             let counter = index.size_counter();
             assert_eq!(counter.load(Ordering::SeqCst), 0);
 
@@ -493,8 +647,9 @@ mod tests {
         }
 
         #[rstest]
-        fn tracks_blocks_from_block_struct() {
-            let mut index = BlockIndex::new(PathBuf::from("unused"));
+        #[tokio::test]
+        async fn tracks_blocks_from_block_struct(file_cache: Arc<FileCache>) {
+            let mut index = BlockIndex::new(PathBuf::from("unused"), file_cache);
             let block = Block::new(3);
             index.insert_or_update(&block);
             index.insert_or_update(block);
@@ -503,21 +658,22 @@ mod tests {
 
         #[rstest]
         #[tokio::test]
-        async fn restored_from_disk() {
+        async fn restored_from_disk(file_cache: Arc<FileCache>) {
             let path = tempdir().unwrap().keep().join(BLOCK_INDEX_FILE);
-            let mut index = BlockIndex::new(path.clone());
+            let mut index = BlockIndex::new(path.clone(), file_cache.clone());
             index.insert_or_update(entry(1, 10, 2));
             index.insert_or_update(entry(2, 30, 4));
             index.save().await.unwrap();
 
-            let loaded = BlockIndex::try_load(path).await.unwrap();
+            let loaded = BlockIndex::try_load(path, file_cache).await.unwrap();
             assert_eq!(loaded.size_counter().load(Ordering::SeqCst), 46);
             assert_counter_matches_fold(&loaded);
         }
 
         #[rstest]
-        fn adopted_counter_is_published() {
-            let mut index = BlockIndex::new(PathBuf::from("unused"));
+        #[tokio::test]
+        async fn adopted_counter_is_published(file_cache: Arc<FileCache>) {
+            let mut index = BlockIndex::new(PathBuf::from("unused"), file_cache);
             index.insert_or_update(entry(1, 10, 2));
             let shared = Arc::new(AtomicU64::new(999));
 
@@ -534,8 +690,9 @@ mod tests {
         use super::*;
 
         #[rstest]
-        fn skip_corrupted_blocks() {
-            let mut index = BlockIndex::new(PathBuf::from("unused"));
+        #[tokio::test]
+        async fn skip_corrupted_blocks(file_cache: Arc<FileCache>) {
+            let mut index = BlockIndex::new(PathBuf::from("unused"), file_cache);
             assert_eq!(index.first_active_block_id(), None);
             assert_eq!(index.last_active_block_id(), None);
             assert_eq!(index.active_block_id_at(10), None);
@@ -559,12 +716,52 @@ mod tests {
         }
     }
 
+    mod versions {
+        use super::*;
+
+        fn entry(version: Option<u64>) -> BlockEntry {
+            BlockEntry {
+                block_id: 1,
+                size: 1,
+                record_count: 1,
+                metadata_size: 1,
+                latest_record_time: Some(Timestamp::default()),
+                crc64: None,
+                compression: None,
+                corrupted: None,
+                version,
+            }
+        }
+
+        #[rstest]
+        #[tokio::test]
+        async fn keeps_version_when_update_has_none(file_cache: Arc<FileCache>) {
+            let mut block_index = BlockIndex::new(PathBuf::new(), file_cache);
+            block_index.insert_or_update_with_crc(entry(Some(3)), 7);
+            block_index.insert_or_update(entry(None));
+
+            let block = block_index.get_block(1).unwrap();
+            assert_eq!(block.version, Some(3));
+            assert_eq!(block.crc64, None);
+        }
+
+        #[rstest]
+        #[tokio::test]
+        async fn takes_explicit_version(file_cache: Arc<FileCache>) {
+            let mut block_index = BlockIndex::new(PathBuf::new(), file_cache);
+            block_index.insert_or_update(entry(Some(3)));
+            block_index.insert_or_update(entry(Some(5)));
+
+            assert_eq!(block_index.get_block(1).unwrap().version, Some(5));
+        }
+    }
+
     mod try_load {
         use super::*;
 
         #[rstest]
         #[tokio::test]
-        async fn test_ok() {
+        async fn test_ok(file_cache: Arc<FileCache>) {
             let path = tempdir().unwrap().keep().join(BLOCK_INDEX_FILE);
 
             let block_index_proto = BlockIndexProto {
@@ -583,18 +780,24 @@ mod tests {
             };
             fs::write(&path, block_index_proto.encode_to_vec()).unwrap();
 
-            let block_index = BlockIndex::try_load(path.clone()).await.unwrap();
+            let block_index = BlockIndex::try_load(path.clone(), file_cache.clone())
+                .await
+                .unwrap();
             assert_eq!(block_index.size(), 2);
             assert_eq!(block_index.record_count(), 1);
-            assert_eq!(block_index.tree().len(), 1);
+            assert_eq!(block_index.block_ids().len(), 1);
+            assert_eq!(block_index.last_record_index().get(&1), Some(&0));
             assert_eq!(block_index.path_buf, path);
         }
 
         #[rstest]
         #[tokio::test]
-        async fn test_index_file_not_found() {
+        async fn test_index_file_not_found(file_cache: Arc<FileCache>) {
             let path = PathBuf::from("not_found");
-            let block_index = BlockIndex::try_load(path.clone()).await.err().unwrap();
+            let block_index = BlockIndex::try_load(path.clone(), file_cache.clone())
+                .await
+                .err()
+                .unwrap();
             assert_eq!(
                 block_index,
                 internal_server_error!("Block index {:?} not found", path)
@@ -603,7 +806,7 @@ mod tests {
 
         #[rstest]
         #[tokio::test]
-        async fn test_index_file_corrupted() {
+        async fn test_index_file_corrupted(file_cache: Arc<FileCache>) {
             let path = tempdir().unwrap().keep().join(BLOCK_INDEX_FILE);
 
             let block_index_proto = BlockIndexProto {
@@ -622,7 +825,10 @@ mod tests {
             };
             fs::write(&path, block_index_proto.encode_to_vec()).unwrap();
 
-            let block_index = BlockIndex::try_load(path.clone()).await.err().unwrap();
+            let block_index = BlockIndex::try_load(path.clone(), file_cache.clone())
+                .await
+                .err()
+                .unwrap();
             assert_eq!(
                 block_index,
                 internal_server_error!("Block index {:?} is corrupted", path)
@@ -631,11 +837,14 @@ mod tests {
 
         #[rstest]
         #[tokio::test]
-        async fn test_decode_err() {
+        async fn test_decode_err(file_cache: Arc<FileCache>) {
             let path = tempdir().unwrap().keep().join(BLOCK_INDEX_FILE);
             fs::write(&path, vec![0, 1, 2, 3]).unwrap();
 
-            let block_index = BlockIndex::try_load(path.clone()).await.err().unwrap();
+            let block_index = BlockIndex::try_load(path.clone(), file_cache.clone())
+                .await
+                .err()
+                .unwrap();
             assert_eq!(block_index, internal_server_error!("Failed to decode block index {:?}: failed to decode Protobuf message: invalid tag value: 0", path));
         }
     }
@@ -645,10 +854,19 @@ mod tests {
 
         #[rstest]
         #[tokio::test]
-        async fn test_ok() {
+        async fn test_debug_includes_crc64(file_cache: Arc<FileCache>) {
+            let path = tempdir().unwrap().keep().join(BLOCK_INDEX_FILE);
+            let block_index = BlockIndex::new(path, file_cache);
+
+            assert!(format!("{block_index:?}").contains("crc64: 0"));
+        }
+
+        #[rstest]
+        #[tokio::test]
+        async fn test_ok(file_cache: Arc<FileCache>) {
             let path = tempdir().unwrap().keep().join(BLOCK_INDEX_FILE);
 
-            let mut block_index = BlockIndex::new(path.clone());
+            let mut block_index = BlockIndex::new(path.clone(), file_cache.clone());
             block_index.insert_or_update(BlockEntry {
                 block_id: 1,
                 size: 1,
@@ -663,18 +881,20 @@ mod tests {
 
             block_index.save().await.unwrap();
 
-            let block_index_proto = BlockIndex::try_load(path.clone()).await.unwrap();
+            let block_index_proto = BlockIndex::try_load(path.clone(), file_cache.clone())
+                .await
+                .unwrap();
             assert_eq!(block_index_proto.size(), 2);
             assert_eq!(block_index_proto.record_count(), 1);
-            assert_eq!(block_index_proto.tree().len(), 1);
+            assert_eq!(block_index_proto.block_ids().len(), 1);
         }
 
         #[rstest]
         #[tokio::test]
-        async fn test_corrupted_round_trip() {
+        async fn test_corrupted_round_trip(file_cache: Arc<FileCache>) {
             let path = tempdir().unwrap().keep().join(BLOCK_INDEX_FILE);
 
-            let mut block_index = BlockIndex::new(path.clone());
+            let mut block_index = BlockIndex::new(path.clone(), file_cache.clone());
             block_index.insert_or_update(BlockEntry {
                 block_id: 1,
                 size: 1,
@@ -694,48 +914,80 @@ mod tests {
 
             block_index.save().await.unwrap();
 
-            let block_index = BlockIndex::try_load(path).await.unwrap();
+            let block_index = BlockIndex::try_load(path, file_cache.clone())
+                .await
+                .unwrap();
             assert!(block_index.is_corrupted(1));
             assert_eq!(block_index.corrupted_block_count(), 1);
             assert_eq!(block_index.corrupted_block_ids(), vec![1]);
         }
     }
 
-    mod versions {
+    mod aggregate_stats {
         use super::*;
 
-        fn entry(version: Option<u64>) -> BlockEntry {
+        fn block(
+            block_id: u64,
+            size: u64,
+            metadata_size: u64,
+            record_count: u64,
+            latest_record_time: u64,
+            corrupted: Option<bool>,
+        ) -> BlockEntry {
             BlockEntry {
-                block_id: 1,
-                size: 1,
-                record_count: 1,
-                metadata_size: 1,
-                latest_record_time: Some(Timestamp::default()),
+                block_id,
+                size,
+                record_count,
+                metadata_size,
+                latest_record_time: Some(us_to_ts(&latest_record_time)),
                 crc64: None,
                 compression: None,
-                corrupted: None,
-                version,
+                corrupted,
+                version: None,
             }
         }
 
         #[rstest]
-        fn keeps_version_when_update_has_none() {
-            let mut block_index = BlockIndex::new(PathBuf::new());
-            block_index.insert_or_update_with_crc(entry(Some(3)), 7);
-            block_index.insert_or_update(entry(None));
-
-            let block = block_index.get_block(1).unwrap();
-            assert_eq!(block.version, Some(3));
-            assert_eq!(block.crc64, None);
+        #[tokio::test]
+        async fn returns_default_for_empty_index(file_cache: Arc<FileCache>) {
+            assert_eq!(
+                BlockIndex::new(PathBuf::from("index"), file_cache).aggregate_stats(),
+                BlockIndexSummary::default()
+            );
         }
 
         #[rstest]
-        fn takes_explicit_version() {
-            let mut block_index = BlockIndex::new(PathBuf::new());
-            block_index.insert_or_update(entry(Some(3)));
-            block_index.insert_or_update(entry(Some(5)));
+        #[tokio::test]
+        async fn includes_corrupted_blocks_in_totals_but_not_record_bounds(
+            file_cache: Arc<FileCache>,
+        ) {
+            let mut index = BlockIndex::new(PathBuf::from("index"), file_cache);
+            index.insert_or_update(block(1, 10, 1, 2, 10, Some(true)));
+            index.insert_or_update(block(2, 20, 2, 0, 20, None));
+            index.insert_or_update(block(3, 30, 3, 1, 30, None));
 
-            assert_eq!(block_index.get_block(1).unwrap().version, Some(5));
+            assert_eq!(
+                index.aggregate_stats(),
+                BlockIndexSummary {
+                    size: 66,
+                    record_count: 3,
+                    block_count: 3,
+                    oldest_record: 3,
+                    latest_record: 30,
+                }
+            );
+        }
+
+        #[rstest]
+        #[tokio::test]
+        async fn returns_bounds_from_multiple_active_nonempty_blocks(file_cache: Arc<FileCache>) {
+            let mut index = BlockIndex::new(PathBuf::from("index"), file_cache);
+            index.insert_or_update(block(10, 1, 0, 1, 15, None));
+            index.insert_or_update(block(20, 1, 0, 1, 25, None));
+
+            let summary = index.aggregate_stats();
+            assert_eq!(summary.oldest_record, 10);
+            assert_eq!(summary.latest_record, 25);
         }
     }
 }

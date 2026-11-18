@@ -15,9 +15,10 @@ use reduct_base::error::ReductError;
 use reduct_base::internal_server_error;
 
 use crate::backend::file::File;
-use crate::core::file_cache::FILE_CACHE;
+use crate::core::file_cache::{BatchToken, FileCache};
 use crate::storage::proto::Record;
 use byteorder::{BigEndian, ReadBytesExt};
+use std::sync::Arc;
 
 const WAL_FILE_SIZE: u64 = 1_000_000;
 const WAL_DIR: &str = ".wal";
@@ -69,16 +70,20 @@ impl WalEntry {
     pub fn decode(type_code: u8, buf: &[u8]) -> Result<Self, ReductError> {
         match type_code {
             0 => {
-                let record = Record::decode(buf).unwrap();
+                let record = Record::decode(buf)
+                    .map_err(|err| internal_server_error!("Invalid WAL record: {}", err))?;
                 Ok(WalEntry::WriteRecord(record))
             }
             1 => {
-                let record = Record::decode(buf).unwrap();
+                let record = Record::decode(buf)
+                    .map_err(|err| internal_server_error!("Invalid WAL record: {}", err))?;
                 Ok(WalEntry::UpdateRecord(record))
             }
             2 => Ok(WalEntry::RemoveBlock),
             3 => {
-                let record_id = u64::from_be_bytes(buf.try_into().unwrap());
+                let record_id = u64::from_be_bytes(buf.try_into().map_err(|_| {
+                    internal_server_error!("Invalid WAL remove-record entry length")
+                })?);
                 Ok(WalEntry::RemoveRecord(record_id))
             }
             _ => Err(internal_server_error!("Invalid WAL entry")),
@@ -108,6 +113,10 @@ pub(in crate::storage) trait Wal {
     /// * `Ok(())` if the entry was successfully appended
     async fn append(&mut self, block_id: u64, entry: WalEntry) -> Result<(), ReductError>;
 
+    fn set_batch_token(&mut self, token: BatchToken);
+
+    fn clear_batch_token(&mut self);
+
     /// Read all WAL entries for a block
     ///
     /// # Arguments
@@ -130,21 +139,28 @@ struct WalImpl {
     root_path: PathBuf,
     file_positions: HashMap<u64, u64>,
     known_blocks: BTreeSet<u64>,
+    batch_token: Option<BatchToken>,
+    file_cache: Arc<FileCache>,
 }
 
 impl WalImpl {
-    pub async fn try_build(path_buf: PathBuf) -> Result<Self, ReductError> {
+    pub async fn try_build(
+        path_buf: PathBuf,
+        file_cache: Arc<FileCache>,
+    ) -> Result<Self, ReductError> {
         let mut wal = WalImpl {
             root_path: path_buf,
             file_positions: HashMap::new(), // we need to keep track of the file positions for each block because of file cache
             known_blocks: BTreeSet::new(),
+            batch_token: None,
+            file_cache,
         };
 
         let mut blocks = BTreeSet::new();
 
         // WAL files can be dirty only in the local cache. Remote backends list
         // objects from remote storage, so check the local WAL directory first to
-        // make strict sync/compaction see WALs before FILE_CACHE uploads them.
+        // make strict sync/compaction see WALs before FileCache uploads them.
         let local_entries = match tokio::fs::read_dir(&wal.root_path).await {
             Ok(entries) => Some(entries),
             Err(err) if err.kind() == ErrorKind::NotFound => None,
@@ -159,7 +175,7 @@ impl WalImpl {
             }
         }
 
-        for path in FILE_CACHE.read_dir(&wal.root_path).await? {
+        for path in wal.file_cache.read_dir(&wal.root_path).await? {
             if let Some(block_id) = Self::parse_wal_block_id(&path) {
                 blocks.insert(block_id);
             }
@@ -186,20 +202,24 @@ const STOP_MARKER: u8 = 255;
 
 #[async_trait]
 impl Wal for WalImpl {
+    fn set_batch_token(&mut self, token: BatchToken) {
+        self.batch_token = Some(token);
+    }
+
+    fn clear_batch_token(&mut self) {
+        self.batch_token = None;
+    }
+
     async fn append(&mut self, block_id: u64, entry: WalEntry) -> Result<(), ReductError> {
         let path = self.block_wal_path(block_id);
         let (mut file, start) = match self.file_positions.get(&block_id) {
             Some(&pos) => {
-                let file = FILE_CACHE
-                    .write_or_create(&path, SeekFrom::Current(0))
-                    .await?;
+                let file = self.write_or_create(&path, SeekFrom::Current(0)).await?;
                 (file, pos.saturating_sub(1))
             }
             None => {
-                let exists = FILE_CACHE.try_exists(&path).await?;
-                let mut file = FILE_CACHE
-                    .write_or_create(&path, SeekFrom::Current(0))
-                    .await?;
+                let exists = self.file_cache.try_exists(&path).await?;
+                let mut file = self.write_or_create(&path, SeekFrom::Current(0)).await?;
                 if exists {
                     warn!(
                         "File position for block {} not found. Overwrite WAL",
@@ -230,12 +250,15 @@ impl Wal for WalImpl {
 
     async fn read(&self, block_id: u64) -> Result<Vec<WalEntry>, ReductError> {
         let path = self.block_wal_path(block_id);
-        let mut file = FILE_CACHE.read(&path, SeekFrom::Start(0)).await?;
+        let mut file = self.file_cache.read(&path, SeekFrom::Start(0)).await?;
 
         let mut entries = Vec::new();
         loop {
             let entry_type = match file.read_u8() {
                 Ok(t) => t,
+                Err(err) if !entries.is_empty() && err.kind() == ErrorKind::UnexpectedEof => {
+                    return Ok(entries)
+                }
                 Err(err) => return Err(err.into()),
             };
 
@@ -246,20 +269,45 @@ impl Wal for WalImpl {
             let mut crc = Digest::new();
             crc.write(&[entry_type]);
 
-            let len = file.read_u64::<BigEndian>()?;
+            let len = match file.read_u64::<BigEndian>() {
+                Ok(len) => len,
+                Err(err) if err.kind() == ErrorKind::UnexpectedEof => {
+                    return Self::recover_prefix_or_error(entries, &path)
+                }
+                Err(err) => return Err(err.into()),
+            };
+            let position = file.stream_position()?;
+            if len > WAL_FILE_SIZE.saturating_sub(position + mem::size_of::<u64>() as u64 + 1) {
+                return Self::recover_prefix_or_error(entries, &path);
+            }
             crc.write(&len.to_be_bytes());
 
             let mut buf = vec![0; len as usize];
-            file.read_exact(&mut buf)?;
+            if let Err(err) = file.read_exact(&mut buf) {
+                if err.kind() == ErrorKind::UnexpectedEof {
+                    return Self::recover_prefix_or_error(entries, &path);
+                }
+                return Err(err.into());
+            }
             crc.write(&buf);
 
-            let crc_bytes = file.read_u64::<BigEndian>()?;
+            let crc_bytes = match file.read_u64::<BigEndian>() {
+                Ok(crc) => crc,
+                Err(err) if err.kind() == ErrorKind::UnexpectedEof => {
+                    return Self::recover_prefix_or_error(entries, &path)
+                }
+                Err(err) => return Err(err.into()),
+            };
 
             if crc.sum64() != crc_bytes {
-                return Err(internal_server_error!("WAL {:?} is corrupted", path));
+                return Self::recover_prefix_or_error(entries, &path);
             }
 
-            let entry = WalEntry::decode(entry_type, &buf)?;
+            let entry = match WalEntry::decode(entry_type, &buf) {
+                Ok(entry) => entry,
+                Err(_) if !entries.is_empty() => return Ok(entries),
+                Err(err) => return Err(err),
+            };
             entries.push(entry);
         }
 
@@ -269,8 +317,8 @@ impl Wal for WalImpl {
     async fn remove(&mut self, block_id: u64) -> Result<(), ReductError> {
         if self.known_blocks.contains(&block_id) {
             let path = self.block_wal_path(block_id);
-            if FILE_CACHE.try_exists(&path).await? {
-                FILE_CACHE.remove(&path).await?;
+            if self.file_cache.try_exists(&path).await? {
+                self.remove_file(&path).await?;
             }
         }
         self.known_blocks.remove(&block_id);
@@ -280,6 +328,42 @@ impl Wal for WalImpl {
 
     async fn list(&self) -> Result<Vec<u64>, ReductError> {
         Ok(self.known_blocks.iter().copied().collect())
+    }
+}
+
+impl WalImpl {
+    fn recover_prefix_or_error(
+        entries: Vec<WalEntry>,
+        path: &Path,
+    ) -> Result<Vec<WalEntry>, ReductError> {
+        if entries.is_empty() {
+            Err(internal_server_error!("WAL {:?} is corrupted", path))
+        } else {
+            warn!("Ignoring incomplete WAL tail in {:?}", path);
+            Ok(entries)
+        }
+    }
+
+    async fn write_or_create(
+        &self,
+        path: &PathBuf,
+        pos: SeekFrom,
+    ) -> Result<crate::core::file_cache::FileGuard, ReductError> {
+        match &self.batch_token {
+            Some(token) => {
+                self.file_cache
+                    .write_or_create_in_batch(token, path, pos)
+                    .await
+            }
+            None => self.file_cache.write_or_create(path, pos).await,
+        }
+    }
+
+    async fn remove_file(&self, path: &PathBuf) -> Result<(), ReductError> {
+        match &self.batch_token {
+            Some(token) => self.file_cache.remove_in_batch(token, path).await,
+            None => self.file_cache.remove(path).await,
+        }
     }
 }
 
@@ -298,12 +382,13 @@ impl Wal for WalImpl {
 ///
 pub(in crate::storage) async fn create_wal(
     entry_path: PathBuf,
+    file_cache: Arc<FileCache>,
 ) -> Result<Box<dyn Wal + Send + Sync>, ReductError> {
     let wal_folder = entry_path.join(WAL_DIR);
     let legacy_wal_folder = entry_path.join(LEGACY_WAL_DIR);
 
     if !wal_folder.try_exists()? && legacy_wal_folder.try_exists()? {
-        if let Err(err) = FILE_CACHE.rename(&legacy_wal_folder, &wal_folder).await {
+        if let Err(err) = file_cache.rename(&legacy_wal_folder, &wal_folder).await {
             warn!(
                 "Failed to migrate legacy WAL folder {:?} to {:?}: {}",
                 legacy_wal_folder, wal_folder, err
@@ -312,27 +397,34 @@ pub(in crate::storage) async fn create_wal(
     }
 
     if !wal_folder.try_exists()? {
-        FILE_CACHE.create_dir_all(&wal_folder).await?;
+        file_cache.create_dir_all(&wal_folder).await?;
     }
 
     Ok(Box::new(
-        WalImpl::try_build(entry_path.join(WAL_DIR)).await?,
+        WalImpl::try_build(entry_path.join(WAL_DIR), file_cache).await?,
     ))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::file_cache::{build_test_file_cache, FileCache};
     use crate::core::sync::{reset_rwlock_config, set_rwlock_timeout};
     use reduct_base::error::ErrorCode;
     use rstest::*;
     use serial_test::serial;
     use std::fs::OpenOptions;
+    use std::sync::Arc;
     use std::time::Duration;
+
+    #[fixture]
+    fn file_cache() -> Arc<FileCache> {
+        build_test_file_cache()
+    }
 
     #[rstest]
     #[tokio::test]
-    async fn test_read(#[future] wal: WalImpl) {
+    async fn test_read(#[future] wal: WalImpl, file_cache: Arc<FileCache>) {
         let mut wal = wal.await;
         wal.append(1, WalEntry::WriteRecord(Record::default()))
             .await
@@ -343,9 +435,12 @@ mod tests {
         wal.append(1, WalEntry::RemoveBlock).await.unwrap();
         wal.append(1, WalEntry::RemoveRecord(1)).await.unwrap();
 
-        let wal = create_wal(wal.root_path.parent().unwrap().to_path_buf())
-            .await
-            .unwrap();
+        let wal = create_wal(
+            wal.root_path.parent().unwrap().to_path_buf(),
+            file_cache.clone(),
+        )
+        .await
+        .unwrap();
         let entries = wal.read(1).await.unwrap();
 
         assert_eq!(
@@ -361,7 +456,7 @@ mod tests {
 
     #[rstest]
     #[tokio::test]
-    async fn test_remove(#[future] wal: WalImpl) {
+    async fn test_remove(#[future] wal: WalImpl, file_cache: Arc<FileCache>) {
         let mut wal = wal.await;
         wal.append(1, WalEntry::WriteRecord(Record::default()))
             .await
@@ -370,16 +465,19 @@ mod tests {
         assert_eq!(wal.read(1).await.unwrap().len(), 1);
         wal.remove(1).await.unwrap();
 
-        let wal = create_wal(wal.root_path.parent().unwrap().to_path_buf())
-            .await
-            .unwrap();
+        let wal = create_wal(
+            wal.root_path.parent().unwrap().to_path_buf(),
+            file_cache.clone(),
+        )
+        .await
+        .unwrap();
         let err = wal.read(1).await.err().unwrap();
         assert_eq!(&err.status, &ErrorCode::InternalServerError);
     }
 
     #[rstest]
     #[tokio::test]
-    async fn test_list(#[future] wal: WalImpl) {
+    async fn test_list(#[future] wal: WalImpl, file_cache: Arc<FileCache>) {
         let mut wal = wal.await;
         wal.append(1, WalEntry::WriteRecord(Record::default()))
             .await
@@ -388,9 +486,12 @@ mod tests {
             .await
             .unwrap();
 
-        let wal = create_wal(wal.root_path.parent().unwrap().to_path_buf())
-            .await
-            .unwrap();
+        let wal = create_wal(
+            wal.root_path.parent().unwrap().to_path_buf(),
+            file_cache.clone(),
+        )
+        .await
+        .unwrap();
         let blocks = wal.list().await.unwrap();
         assert_eq!(blocks.len(), 2);
         assert!(blocks.contains(&1));
@@ -407,9 +508,17 @@ mod tests {
         assert_eq!(WalImpl::parse_wal_block_id(&PathBuf::from("bad.wal")), None);
     }
 
+    #[test]
+    fn decode_rejects_remove_record_with_invalid_length() {
+        let error = WalEntry::decode(3, &[0; 7]).unwrap_err();
+
+        assert_eq!(error.status, ErrorCode::InternalServerError);
+        assert_eq!(error.message, "Invalid WAL remove-record entry length");
+    }
+
     #[rstest]
     #[tokio::test]
-    async fn test_crc_error(#[future] wal: WalImpl) {
+    async fn test_crc_error(#[future] wal: WalImpl, file_cache: Arc<FileCache>) {
         let mut wal = wal.await;
         wal.append(1, WalEntry::WriteRecord(Record::default()))
             .await
@@ -420,21 +529,57 @@ mod tests {
         file.seek(SeekFrom::Start(0)).unwrap();
         file.write_all(&[0, 0, 0, 0, 0, 0, 0, 0, 0, 1]).unwrap();
 
-        let wal = create_wal(wal.root_path.parent().unwrap().to_path_buf())
-            .await
-            .unwrap();
+        let wal = create_wal(
+            wal.root_path.parent().unwrap().to_path_buf(),
+            file_cache.clone(),
+        )
+        .await
+        .unwrap();
         let err = wal.read(1).await.err().unwrap();
         assert_eq!(&err.status, &ErrorCode::InternalServerError);
     }
 
     #[rstest]
     #[tokio::test]
-    async fn cache_invalidation(#[future] wal: WalImpl) {
+    async fn read_keeps_valid_entries_before_torn_tail(
+        #[future] wal: WalImpl,
+        file_cache: Arc<FileCache>,
+    ) {
+        let mut wal = wal.await;
+        wal.append(1, WalEntry::WriteRecord(Record::default()))
+            .await
+            .unwrap();
+        wal.append(1, WalEntry::UpdateRecord(Record::default()))
+            .await
+            .unwrap();
+
+        let path = wal.block_wal_path(1);
+        let first_entry_len = 1 + (std::mem::size_of::<u64>() * 2) as u64 + 1;
+        let mut file = OpenOptions::new().write(true).open(&path).unwrap();
+        file.seek(SeekFrom::Start(first_entry_len)).unwrap();
+        file.write_all(&[0; 10]).unwrap();
+
+        let wal = create_wal(
+            wal.root_path.parent().unwrap().to_path_buf(),
+            file_cache.clone(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            wal.read(1).await.unwrap(),
+            vec![WalEntry::WriteRecord(Record::default())]
+        );
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn cache_invalidation(#[future] wal: WalImpl, file_cache: Arc<FileCache>) {
         let mut wal = wal.await;
         wal.append(1, WalEntry::UpdateRecord(Record::default()))
             .await
             .unwrap();
-        FILE_CACHE
+        file_cache
             .discard_recursive(&wal.root_path.join("1.wal"))
             .await
             .unwrap();
@@ -455,13 +600,15 @@ mod tests {
 
     #[rstest]
     #[tokio::test]
-    async fn test_migrate_legacy_wal_dir() {
+    async fn test_migrate_legacy_wal_dir(file_cache: Arc<FileCache>) {
         let path = tempfile::tempdir().unwrap().keep();
         let entry_path = path.join("entry");
         std::fs::create_dir_all(entry_path.join(LEGACY_WAL_DIR)).unwrap();
         std::fs::write(entry_path.join(LEGACY_WAL_DIR).join("1.wal"), [STOP_MARKER]).unwrap();
 
-        let wal = create_wal(entry_path.clone()).await.unwrap();
+        let wal = create_wal(entry_path.clone(), file_cache.clone())
+            .await
+            .unwrap();
 
         assert!(entry_path.join(WAL_DIR).exists());
         assert!(!entry_path.join(LEGACY_WAL_DIR).exists());
@@ -470,22 +617,32 @@ mod tests {
 
     #[rstest]
     #[tokio::test]
-    async fn test_try_build_returns_error_if_local_wal_path_is_not_directory() {
+    async fn test_try_build_returns_error_if_local_wal_path_is_not_directory(
+        file_cache: Arc<FileCache>,
+    ) {
         let path = tempfile::tempdir().unwrap().keep();
         let wal_path = path.join(WAL_DIR);
         std::fs::write(&wal_path, b"not a directory").unwrap();
 
-        let err = WalImpl::try_build(wal_path).await.err().unwrap();
+        let err = WalImpl::try_build(wal_path, file_cache.clone())
+            .await
+            .err()
+            .unwrap();
         assert_eq!(err.status, ErrorCode::InternalServerError);
     }
 
     #[rstest]
     #[tokio::test]
-    async fn test_try_build_missing_local_wal_dir_propagates_backend_error() {
+    async fn test_try_build_missing_local_wal_dir_propagates_backend_error(
+        file_cache: Arc<FileCache>,
+    ) {
         let path = tempfile::tempdir().unwrap().keep();
         let wal_path = path.join(WAL_DIR);
 
-        let err = WalImpl::try_build(wal_path).await.err().unwrap();
+        let err = WalImpl::try_build(wal_path, file_cache.clone())
+            .await
+            .err()
+            .unwrap();
         assert_eq!(err.status, ErrorCode::InternalServerError);
     }
 
@@ -532,7 +689,9 @@ mod tests {
             .await
             .unwrap();
 
-        let mut wal = WalImpl::try_build(wal.root_path.clone()).await.unwrap();
+        let mut wal = WalImpl::try_build(wal.root_path.clone(), wal.file_cache.clone())
+            .await
+            .unwrap();
         assert_eq!(wal.list().await.unwrap(), vec![1]);
         assert!(wal.file_positions.is_empty());
 
@@ -551,7 +710,8 @@ mod tests {
             .unwrap();
         let position = stream_position(&wal, 1).await;
 
-        let guard = FILE_CACHE
+        let guard = wal
+            .file_cache
             .write_or_create(&wal.block_wal_path(1), SeekFrom::Current(0))
             .await
             .unwrap();
@@ -569,7 +729,7 @@ mod tests {
     }
 
     async fn stream_position(wal: &WalImpl, block_id: u64) -> u64 {
-        FILE_CACHE
+        wal.file_cache
             .write_or_create(&wal.block_wal_path(block_id), SeekFrom::Current(0))
             .await
             .unwrap()
@@ -578,9 +738,11 @@ mod tests {
     }
 
     #[fixture]
-    async fn wal() -> WalImpl {
+    async fn wal(file_cache: Arc<FileCache>) -> WalImpl {
         let path = tempfile::tempdir().unwrap().keep();
         std::fs::create_dir_all(path.join(WAL_DIR)).unwrap();
-        WalImpl::try_build(path.join(WAL_DIR)).await.unwrap()
+        WalImpl::try_build(path.join(WAL_DIR), file_cache.clone())
+            .await
+            .unwrap()
     }
 }

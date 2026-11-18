@@ -270,7 +270,7 @@ impl LifecycleTask {
                 .unwrap_or_default()
                 .as_micros() as u64,
             instance: sink.instance_name.clone(),
-            entry_name: Self::sanitize_task_name(name),
+            entry_name: name.to_string(),
             status,
             message,
             payload,
@@ -302,18 +302,6 @@ impl LifecycleTask {
                 name, err
             ),
         }
-    }
-
-    fn sanitize_task_name(name: &str) -> String {
-        name.chars()
-            .map(|ch| {
-                if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.') {
-                    ch
-                } else {
-                    '_'
-                }
-            })
-            .collect()
     }
 }
 
@@ -537,13 +525,13 @@ pub(super) mod tests {
     #[tokio::test]
     async fn log_system_event_writes_success_message() {
         let captured = Arc::new(Mutex::new(Vec::<SystemEvent>::new()));
-        let sink = SystemEventSink {
-            system_logger: Arc::new(AsyncRwLock::new(Box::new(CapturingSystemLogger {
+        let sink = SystemEventSink::new(
+            Arc::new(AsyncRwLock::new(Box::new(CapturingSystemLogger {
                 events: Arc::clone(&captured),
             })
                 as Box<dyn LogSystemEvent + Send + Sync>)),
-            instance_name: "instance-1".to_string(),
-        };
+            "instance-1".to_string(),
+        );
 
         LifecycleTask::log_system_event(
             Some(sink),
@@ -582,13 +570,13 @@ pub(super) mod tests {
     #[tokio::test]
     async fn log_system_event_writes_compression_metrics() {
         let captured = Arc::new(Mutex::new(Vec::<SystemEvent>::new()));
-        let sink = SystemEventSink {
-            system_logger: Arc::new(AsyncRwLock::new(Box::new(CapturingSystemLogger {
+        let sink = SystemEventSink::new(
+            Arc::new(AsyncRwLock::new(Box::new(CapturingSystemLogger {
                 events: Arc::clone(&captured),
             })
                 as Box<dyn LogSystemEvent + Send + Sync>)),
-            instance_name: "instance-1".to_string(),
-        };
+            "instance-1".to_string(),
+        );
 
         LifecycleTask::log_system_event(
             Some(sink),
@@ -618,13 +606,13 @@ pub(super) mod tests {
     #[tokio::test]
     async fn log_system_event_writes_error_message() {
         let captured = Arc::new(Mutex::new(Vec::<SystemEvent>::new()));
-        let sink = SystemEventSink {
-            system_logger: Arc::new(AsyncRwLock::new(Box::new(CapturingSystemLogger {
+        let sink = SystemEventSink::new(
+            Arc::new(AsyncRwLock::new(Box::new(CapturingSystemLogger {
                 events: Arc::clone(&captured),
             })
                 as Box<dyn LogSystemEvent + Send + Sync>)),
-            instance_name: "instance-1".to_string(),
-        };
+            "instance-1".to_string(),
+        );
 
         let err = unprocessable_entity!("failed to run");
         LifecycleTask::log_system_event(

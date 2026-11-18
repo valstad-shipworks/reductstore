@@ -2,6 +2,7 @@
 // Licensed under the Apache License, Version 2.0
 
 use super::*;
+use reduct_base::not_found;
 use std::io::ErrorKind::UnexpectedEof;
 
 impl BlockManager {
@@ -133,6 +134,7 @@ impl BlockManager {
                     begin,
                     record_size,
                     read_bytes,
+                    &self.file_cache,
                 )
                 .await
                 {
@@ -199,11 +201,11 @@ impl BlockManager {
         tokio::fs::remove_file(&block_path).await?;
         tokio::fs::rename(&temp_block_path, &block_path).await?;
 
-        FILE_CACHE.discard_recursive(&block_path).await?;
-        let mut block_file = FILE_CACHE
-            .write_or_create(&block_path, SeekFrom::Start(0))
+        self.evict_mutation(&block_path).await?;
+        let mut block_file = self
+            .write_or_create_mutation(&block_path, SeekFrom::Start(0))
             .await?;
-        block_file.sync_all().await?;
+        block_file.flush_local().await?;
 
         self.save_meta_on_disk(block_ref).await
     }
@@ -290,28 +292,42 @@ impl BlockManager {
     /// # Returns
     ///
     /// * `Ok(file, offset)` - File to read from and offset to start reading.
+    ///   A decompressed file stays on disk while `file` is alive.
     ///
     /// # Errors
     ///
-    /// * `ReductError` - If file system operation failed.
-    pub(crate) async fn begin_read_record(
+    /// * `ReductError` - If file system operation failed or the record was removed.
+    pub(in crate::storage) async fn begin_read_record(
         &self,
         block: &Block,
         record_timestamp: u64,
-    ) -> Result<(PathBuf, u64), ReductError> {
+    ) -> Result<(BlockFilePath, u64), ReductError> {
         let path = self.resolve_data_path(block.block_id()).await?;
-        let offset = block.get_record(record_timestamp).unwrap().begin;
+        let offset = block
+            .get_record(record_timestamp)
+            .ok_or_else(|| {
+                not_found!(
+                    "Record {} not found in block {}/{}/{}",
+                    record_timestamp,
+                    self.bucket_name(),
+                    self.entry_name(),
+                    block.block_id()
+                )
+            })?
+            .begin;
         Ok((path, offset))
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::core::file_cache::FileCache;
     use crate::core::sync::AsyncRwLock;
     use crate::storage::block_manager::block_index::BlockIndex;
     use crate::storage::block_manager::compress::CompressionAlgorithm;
-    use crate::storage::block_manager::test_utils::{block, block_id, block_manager, write_record};
+    use crate::storage::block_manager::test_utils::{
+        block, block_id, block_manager, file_cache, write_record,
+    };
     use crate::storage::block_manager::wal::WalEntry;
     use crate::storage::block_manager::{BlockManager, BlockRef, BLOCK_INDEX_FILE};
     use crate::storage::engine::MAX_IO_BUFFER_SIZE;
@@ -364,6 +380,7 @@ mod tests {
         #[future] block_manager: BlockManager,
         #[future] block: BlockRef,
         block_id: u64,
+        file_cache: Arc<FileCache>,
     ) {
         let block_manager = block_manager.await;
         let block = block.await;
@@ -413,6 +430,7 @@ mod tests {
                     .as_slice(),
             )
             .unwrap(),
+            file_cache.clone(),
         )
         .unwrap();
         assert_eq!(
@@ -440,6 +458,7 @@ mod tests {
                     .as_slice(),
             )
             .unwrap(),
+            file_cache.clone(),
         )
         .unwrap();
         assert_eq!(
@@ -462,10 +481,11 @@ mod tests {
         #[future] block_manager: BlockManager,
         #[future] block: BlockRef,
         block_id: u64,
+        file_cache: Arc<FileCache>,
     ) {
         let mut bm = block_manager.await;
         let block = block.await;
-        let index = BlockIndex::try_load(bm.path.join(BLOCK_INDEX_FILE))
+        let index = BlockIndex::try_load(bm.path.join(BLOCK_INDEX_FILE), file_cache.clone())
             .await
             .unwrap();
         assert_eq!(
@@ -541,6 +561,7 @@ mod tests {
         #[future] block_manager: BlockManager,
         #[future] block: BlockRef,
         block_id: u64,
+        file_cache: Arc<FileCache>,
     ) {
         let block_manager = block_manager.await;
         let block = block.await;
@@ -548,14 +569,14 @@ mod tests {
         write_record(1, 100, &block_manager, block.clone()).await;
 
         let mut bm = block_manager.write().await.unwrap();
-        let index = BlockIndex::try_load(bm.path.join(BLOCK_INDEX_FILE))
+        let index = BlockIndex::try_load(bm.path.join(BLOCK_INDEX_FILE), file_cache.clone())
             .await
             .unwrap();
         assert_eq!(index.get_block(1).unwrap().record_count, 2);
 
         bm.remove_records(block_id, vec![1]).await.unwrap();
 
-        let index = BlockIndex::try_load(bm.path.join(BLOCK_INDEX_FILE))
+        let index = BlockIndex::try_load(bm.path.join(BLOCK_INDEX_FILE), file_cache.clone())
             .await
             .unwrap();
         assert_eq!(index.get_block(1).unwrap().record_count, 1, "index updated");
@@ -630,6 +651,73 @@ mod tests {
     }
 
     #[rstest]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_remove_records_from_active_batch_preserves_content(
+        #[future] block_manager: BlockManager,
+        #[future] block: BlockRef,
+        block_id: u64,
+    ) {
+        let mut block_manager = block_manager.await;
+        let block_ref = block.await;
+        let batch = block_manager.file_cache.begin_batch().await.unwrap();
+        block_manager.set_mutation_batch(batch.token());
+        let block_manager = Arc::new(AsyncRwLock::new(block_manager));
+        let (record, expected) = write_record(1, 100, &block_manager, block_ref.clone()).await;
+
+        block_manager
+            .write()
+            .await
+            .unwrap()
+            .remove_records(block_id, vec![0])
+            .await
+            .unwrap();
+
+        let record_time = ts_to_us(&record.timestamp.unwrap());
+        let mut reader = RecordReader::try_new(
+            Arc::clone(&block_manager),
+            block_ref,
+            record_time,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let mut received = BytesMut::new();
+        while let Some(Ok(chunk)) = reader.read_chunk() {
+            received.extend_from_slice(&chunk);
+        }
+
+        assert_eq!(received, expected.as_bytes());
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn test_read_record_removed_after_lookup_is_not_found(
+        #[future] block_manager: BlockManager,
+        #[future] block: BlockRef,
+    ) {
+        let block_manager = Arc::new(AsyncRwLock::new(block_manager.await));
+        let block_ref = block.await;
+        let (record, _) = write_record(1, 10, &block_manager, block_ref.clone()).await;
+        let record_time = ts_to_us(&record.timestamp.unwrap());
+
+        // removed after the reader found it
+        block_ref.write().await.unwrap().remove_record(record_time);
+
+        let err = RecordReader::try_new(
+            Arc::clone(&block_manager),
+            block_ref,
+            record_time,
+            None,
+            None,
+        )
+        .await
+        .err()
+        .expect("an error, not a panic");
+        assert_eq!(err.status, ErrorCode::NotFound);
+    }
+
+    #[rstest]
     #[tokio::test]
     async fn test_remove_only_one_record(#[future] block_manager: BlockManager, block_id: u64) {
         let mut block_manager = block_manager.await;
@@ -650,6 +738,7 @@ mod tests {
     async fn test_remove_records_wal(
         #[future] block_manager: BlockManager,
         #[future] block: BlockRef,
+        file_cache: Arc<FileCache>,
     ) {
         let block_manager = block_manager.await;
         let block = block.await;
@@ -659,7 +748,7 @@ mod tests {
         let mut bm = block_manager.write().await.unwrap();
 
         let block_id = block.read().await.unwrap().block_id();
-        FILE_CACHE.remove(&bm.path_to_data(block_id)).await.unwrap();
+        file_cache.remove(&bm.path_to_data(block_id)).await.unwrap();
 
         let res = bm.remove_records(block_id, vec![1]).await;
         assert!(

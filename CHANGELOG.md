@@ -7,6 +7,98 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Add key-prefix Zenoh bucket routing and multiple key expression support, [PR-1667](https://github.com/reductstore/reductstore/pull/1667)
+
+### Fixed
+
+- Coerce values of the `#strict` query directive with the same rules as condition values, [PR-1721](https://github.com/reductstore/reductstore/pull/1721)
+- Skip publication cycle for clean entry compaction, [PR-1704](https://github.com/reductstore/reductstore/pull/1704)
+- Hide retained attachment versions after removal so attachment listings do not expose deleted keys, [PR-1723](https://github.com/reductstore/reductstore/pull/1723)
+- Preserve acknowledged records across power loss by locally syncing pu- Prevent replica index refreshes from blocking unrelated cached file reads, [PR-1713](https://github.com/reductstore/reductstore/pull/1713)
+- Retain the previous attachment version during replacement so replica listings cannot observe a missing attachment key, [PR-1712](https://github.com/reductstore/reductstore/pull/1712)
+- Retry replica queries after reloading indexes that disagree with cached block descriptors, [PR-1706](https://github.com/reductstore/reductstore/pull/1706)
+- Keep replica reads responsive while refreshed block indexes invalidate remote cache files, [PR-1703](https://github.com/reductstore/reductstore/pull/1703)
+- Validate restored replica block indexes against their publication marker so stale cached indexes cannot hide attachments, [PR-1701](https://github.com/reductstore/reductstore/pull/1701)
+- Preserve the system log capture sink when logger initialization is repeated, [PR-1697](https://github.com/reductstore/reductstore/pull/1697)
+- Prevent admitted mutations from escaping the publication sync snapshot and leaving pending remote mutations, [#1695](https://github.com/reductstore/reductstore/pull/1695)
+- Bind each ready entry publication marker to its exact block index so read-only replicas reject stale cached indexes, [PR-1671](https://github.com/reductstore/reductstore/pull/1671)
+- Avoid blocking update mutations while a scheduled publication synchronizes its current batch, [PR-1666](https://github.com/reductstore/reductstore/pull/1666)
+- Prevent remote cache eviction from unlinking files while they are being accessed, [PR-1665](https://github.com/reductstore/reductstore/pull/1665)
+- Preserve the last committed attachment when its replacement write fails, [#1664](https://github.com/reductstore/reductstore/pull/1664)
+- Preserve retained record payloads when removing records before an active publication batch is committed, [PR-1663](https://github.com/reductstore/reductstore/pull/1663)
+- Prevent idle publication from blocking reads after write bursts, [#1657](https://github.com/reductstore/reductstore/pull/1657)
+- Limit disk usage of decompressed blocks across all entries (`RS_ENGINE_DECOMPRESS_CACHE_SIZE`, default 1GB) and clean up expired, partial and leftover files, [PR-1640](https://github.com/reductstore/reductstore/pull/1640) by @ragen1337
+- Recover read-only replicas from stale compressed block cache entries without returning HTTP 500, [PR-1643](https://github.com/reductstore/reductstore/pull/1643)
+- Keep decompressed files on disk while they are read, so eviction from the decompression cache doesn't break reads of compressed records, [PR-1660](https://github.com/reductstore/reductstore/pull/1660) by @ragen1337
+
+### Internal
+
+- Replace the global file cache singleton with a cache injected through storage components, [PR-1661](https://github.com/reductstore/reductstore/pull/1661)
+- Verify rebuilt block indexes remain synchronized and restore cleanly after restart, [PR-1649](https://github.com/reductstore/reductstore/pull/1649) by @shubhambhar007
+- Publish completed mutation bursts after a short idle period to restore update-after-write throughput, [PR-1647](https://github.com/reductstore/reductstore/pull/1647)
+- Batch entry mutations until cache compaction publishes them, [PR-1646](https://github.com/reductstore/reductstore/pull/1646)
+- Use the shared ReductStore Debian base image for runtime containers, [PR-1639](https://github.com/reductstore/reductstore/pull/1639)
+- Publish entry mutations atomically for read-only replicas, [PR-1637](https://github.com/reductstore/reductstore/pull/1637) by @atimin
+- Replace formatted `ReductError` constructors with error macros, [PR-1631](https://github.com/reductstore/reductstore/pull/1631) by @vintcessun
+
+## 1.21.7 - 2026-11-13
+
+### Fixed
+
+- Return historical query records in timestamp order across overlapping blocks without loading unrelated block descriptors, [PR-1731](https://github.com/reductstore/reductstore/pull/1731)
+
+## 1.21.6 - 2026-11-13
+
+### Fixed
+
+- Reduce memory usage when reading compressed blocks by streaming decompression, [PR-1728](https://github.com/reductstore/reductstore/pull/1728)
+- Avoid loading older blocks when updating labels of missing records, [PR-1726](https://github.com/reductstore/reductstore/pull/1726)
+
+### Changed
+
+- Update Rust dependencies, [PR-1729](https://github.com/reductstore/reductstore/pull/1729)
+
+## 1.21.5 - 2026-10-27
+
+### Fixed
+
+- Persist system events when instance or event names contain characters unsupported by storage entry paths, [PR-1699](https://github.com/reductstore/reductstore/pull/1699)
+
+### Changed
+
+- Update Rust dependencies, [PR-1700](https://github.com/reductstore/reductstore/pull/1700)
+
+## 1.21.4 - 2026-10-21
+
+### Fixed
+
+- Return HTTP 404 instead of panicking when a record is removed between lookup and read, [PR-1684](https://github.com/reductstore/reductstore/pull/1684) by @mjcarroll
+
+## 1.21.3 - 2026-10-16
+
+### Fixed
+
+- Prevent FIFO quota cleanup from blocking storage info requests during slow block deletion, [PR-1673](https://github.com/reductstore/reductstore/pull/1673)
+
+## 1.21.2 - 2026-10-08
+
+### Fixed
+
+- Preserve direct reads and historical queries for belated records written after their target block is full, [PR-1653](https://github.com/reductstore/reductstore/pull/1653)
+
+### Internal
+
+- Use the shared ReductStore Debian base image for stable runtime containers, [PR-1654](https://github.com/reductstore/reductstore/pull/1654)
+
+## 1.21.1 - 2026-09-22
+
+### Changes
+
+- Allow runtime updates to the license reported by `/api/v1/info`, [PR-1621](https://github.com/reductstore/reductstore/pull/1621)
+
+## 1.21.0 - 2026-09-17
 
 ### Breaking Changes
 
@@ -14,6 +106,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Add a snap content interface plug for read-only configuration snaps, [PR-1613](https://github.com/reductstore/reductstore/pull/1613)
+- Send `x-reduct-node-id`, `x-reduct-store-id`, and `x-reduct-license-hash` headers with replication requests, enforcing matching commercial licenses, device limits, and one active node identity per capped device on receivers, [Issue-1580](https://github.com/reductstore/reductstore/issues/1580), [#1611](https://github.com/reductstore/reductstore/pull/1611) by @atimin
+- Persist a deployment UUID in `.uuid` on the configured filesystem, S3, or Azure Blob storage, [PR-1606](https://github.com/reductstore/reductstore/pull/1606) by @anthonycvn
 - Add `RS_ZENOH_BUCKET_MAX_BLOCK_RECORDS` (default 65536) so the auto-created Zenoh bucket rolls blocks far less often under high-rate ingest, and raise the default Zenoh ingest worker cap from 8 to 16 (`RS_ZENOH_INGEST_WORKERS` overrides); for maximum ingest rate on macOS consider `RS_FS_SYNC_INTERVAL_MS`
 - Add an opt-in benchmark API under `/api/v1/benchmark` (`RS_BENCHMARK_API=true`; `RS_BENCHMARK_MAX_TOTAL_SIZE`, `RS_BENCHMARK_MAX_RECORDS`, `RS_BENCHMARK_MAX_CONCURRENCY`, `RS_BENCHMARK_MAX_DURATION` cap requests) with raw disk, engine ingest, and read/query benchmarks
 - Add `RS_FS_FREE_SPACE_CHECK_INTERVAL_MS` to reuse the last free-space sample between writes instead of calling `statvfs` for every record
@@ -35,6 +130,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Update Web Console to v1.17.2, [PR-1615](https://github.com/reductstore/reductstore/pull/1615)
 - Update Web Console to v1.16.0, [PR-1607](https://github.com/reductstore/reductstore/pull/1607)
 - Default `RS_SYSTEM_EVENTS_QUOTA_SIZE` to 10 GB when it is not set, [PR-1556](https://github.com/reductstore/reductstore/pull/1556) by @LordAizen1
 - Allow fork pull request CI to run without protobuf setup tokens or Docker Hub credentials by vendoring `protoc` and making Docker login optional, [PR-1532](https://github.com/reductstore/reductstore/pull/1532)
@@ -66,7 +162,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
-- Invalidate cached bearer credentials after token rotation and store rotated secrets as salted hashes, [CVE-2026-0001](https://github.com/reductstore/reductstore/security/advisories/GHSA-cg68-3m38-wq4c)
+- Invalidate cached bearer credentials after token rotation and store rotated secrets as salted hashes, [CVE-2026-90667](https://github.com/reductstore/reductstore/security/advisories/GHSA-cg68-3m38-wq4c)
 
 ## 1.20.10 - 2026-07-29
 
