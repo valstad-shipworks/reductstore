@@ -9,6 +9,10 @@ use std::sync::Arc;
 use tokio::time::timeout;
 
 /// An async read-write lock with embedded timeouts.
+///
+/// A free lock is taken without arming the timeout. That path still consumes
+/// the cooperative budget of the task like a waiting acquisition does, because
+/// callers that poll in a loop rely on the lock to let other tasks run.
 pub struct AsyncRwLock<T> {
     inner: Arc<tokio::sync::RwLock<T>>,
 }
@@ -26,6 +30,10 @@ impl<T> AsyncRwLock<T> {
     ) -> impl Future<Output = Result<tokio::sync::RwLockReadGuard<'_, T>, ReductError>> + '_ {
         let location = Location::caller();
         async move {
+            tokio::task::consume_budget().await;
+            if let Ok(guard) = self.inner.try_read() {
+                return Ok(guard);
+            }
             timeout(rwlock_timeout(), self.inner.read())
                 .await
                 .map_err(|_| {
@@ -43,6 +51,10 @@ impl<T> AsyncRwLock<T> {
     ) -> impl Future<Output = Result<tokio::sync::RwLockWriteGuard<'_, T>, ReductError>> + '_ {
         let location = Location::caller();
         async move {
+            tokio::task::consume_budget().await;
+            if let Ok(guard) = self.inner.try_write() {
+                return Ok(guard);
+            }
             timeout(rwlock_timeout(), self.inner.write())
                 .await
                 .map_err(|_| {
@@ -64,6 +76,10 @@ impl<T> AsyncRwLock<T> {
     ) -> impl Future<Output = Result<tokio::sync::OwnedRwLockReadGuard<T>, ReductError>> + '_ {
         let location = Location::caller();
         async move {
+            tokio::task::consume_budget().await;
+            if let Ok(guard) = Arc::clone(&self.inner).try_read_owned() {
+                return Ok(guard);
+            }
             timeout(rwlock_timeout(), Arc::clone(&self.inner).read_owned())
                 .await
                 .map_err(|_| {
@@ -89,6 +105,10 @@ impl<T> AsyncRwLock<T> {
     ) -> impl Future<Output = Result<tokio::sync::OwnedRwLockWriteGuard<T>, ReductError>> + '_ {
         let location = Location::caller();
         async move {
+            tokio::task::consume_budget().await;
+            if let Ok(guard) = Arc::clone(&self.inner).try_write_owned() {
+                return Ok(guard);
+            }
             timeout(rwlock_timeout(), Arc::clone(&self.inner).write_owned())
                 .await
                 .map_err(|_| {

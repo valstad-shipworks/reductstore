@@ -62,6 +62,47 @@ pub struct ServerInfo {
     pub defaults: Defaults,
     /// License information if it is `None`, then the instance uses Apache-2.0
     pub license: Option<License>,
+    /// State of the archive tier, `None` when no archive is configured
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub archive: Option<ArchiveInfo>,
+}
+
+/// State of the archive tier that mirrors the data folder and holds the blocks evicted from it
+#[derive(Serialize, Deserialize, Default, Clone, Debug, PartialEq)]
+#[serde(default)]
+pub struct ArchiveInfo {
+    /// Location of the archive
+    pub path: String,
+    /// The archive is reachable
+    pub online: bool,
+    /// The local data folder has been indexed, eviction is held back until then
+    pub ready: bool,
+    /// Maximum size of the local data folder in bytes, `None` disables eviction
+    pub local_size_limit: Option<u64>,
+    /// Size of the local data folder in bytes
+    pub local_usage: u64,
+    /// Size of the data that is stored only in the archive in bytes
+    pub archived_usage: u64,
+    /// Number of data blocks that are stored only in the archive
+    pub archived_files: u64,
+    /// Size of the local files that still have to be copied to the archive in bytes
+    pub pending_usage: u64,
+    /// Number of local files that still have to be copied to the archive
+    pub pending_files: u64,
+    /// Number of removals that still have to be applied to the archive
+    pub pending_removals: u64,
+    /// Seconds the oldest pending change has been waiting
+    pub lag: u64,
+    /// Free space of the archive in bytes
+    pub archive_free: Option<u64>,
+    /// Capacity of the archive in bytes
+    pub archive_total: Option<u64>,
+    /// UNIX timestamp in seconds of the last file copied to the archive
+    pub last_sync: Option<u64>,
+    /// Number of data blocks fetched back from the archive since start
+    pub recalled_files: u64,
+    /// Last archive error
+    pub last_error: Option<String>,
 }
 
 /// Default settings
@@ -95,5 +136,36 @@ mod tests {
         let info: ServerInfo = serde_json::from_value(value).unwrap();
         assert_eq!(info.instance_name, "");
         assert_eq!(info.instance_role, "");
+    }
+
+    #[test]
+    fn server_info_omits_archive_when_not_configured() {
+        let value = serde_json::to_value(ServerInfo::default()).unwrap();
+        assert!(value.get("archive").is_none());
+
+        let info: ServerInfo = serde_json::from_value(value).unwrap();
+        assert_eq!(info.archive, None);
+    }
+
+    #[test]
+    fn archive_info_deserializes_partial_payload() {
+        let info: ServerInfo = serde_json::from_value(serde_json::json!({
+            "version": "1.21.0",
+            "bucket_count": 0,
+            "usage": 0,
+            "uptime": 0,
+            "oldest_record": 0,
+            "latest_record": 0,
+            "defaults": {"bucket": {}},
+            "license": null,
+            "archive": {"path": "/mnt/nas", "online": true, "archived_usage": 42}
+        }))
+        .unwrap();
+
+        let archive = info.archive.unwrap();
+        assert_eq!(archive.path, "/mnt/nas");
+        assert!(archive.online);
+        assert_eq!(archive.archived_usage, 42);
+        assert_eq!(archive.local_size_limit, None);
     }
 }

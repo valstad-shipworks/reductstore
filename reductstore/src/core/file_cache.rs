@@ -8,12 +8,13 @@ use crate::core::sync::{AsyncRwLock, RwLock};
 use log::{debug, warn};
 use reduct_base::error::ReductError;
 use reduct_base::internal_server_error;
+use reduct_base::msg::server_api::ArchiveInfo;
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{ErrorKind, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::OwnedRwLockWriteGuard;
 use tokio::time::sleep;
@@ -26,7 +27,37 @@ const FILE_CACHE_SYNC_BATCH_SIZE: usize = 16;
 
 pub(crate) type FileLock = Arc<AsyncRwLock<File>>;
 // Taken for a map lookup on every file access, never across an await.
-type PathLocks = Arc<parking_lot::Mutex<HashMap<PathBuf, std::sync::Weak<AsyncRwLock<()>>>>>;
+const PATH_SHARDS: usize = 64;
+
+/// A map keyed by path that is split into independently locked shards, so that
+/// callers working on different files do not queue behind one lock.
+struct PathShards<V> {
+    shards: Box<[parking_lot::Mutex<HashMap<PathBuf, V>>]>,
+}
+
+impl<V> PathShards<V> {
+    fn new() -> Self {
+        Self {
+            shards: (0..PATH_SHARDS)
+                .map(|_| parking_lot::Mutex::new(HashMap::new()))
+                .collect(),
+        }
+    }
+
+    fn shard(&self, path: &Path) -> parking_lot::MutexGuard<'_, HashMap<PathBuf, V>> {
+        let hash = path
+            .as_os_str()
+            .as_encoded_bytes()
+            .iter()
+            .fold(0xcbf29ce484222325u64, |hash, byte| {
+                (hash ^ u64::from(*byte)).wrapping_mul(0x100000001b3)
+            });
+        self.shards[(hash % PATH_SHARDS as u64) as usize].lock()
+    }
+}
+
+type PathLocks = Arc<PathShards<std::sync::Weak<AsyncRwLock<()>>>>;
+type PendingAccesses = Arc<PathShards<usize>>;
 pub(crate) type FileGuard = OwnedRwLockWriteGuard<File>;
 
 type BatchId = u64;
@@ -40,7 +71,7 @@ struct BatchRegistry {
 
 struct PathAccessGuard {
     path: PathBuf,
-    pending_accesses: Arc<Mutex<HashMap<PathBuf, usize>>>,
+    pending_accesses: PendingAccesses,
 }
 
 struct PathInvalidationGuard {
@@ -55,7 +86,7 @@ impl Drop for PathInvalidationGuard {
         self.lock.take();
         self.path_lock.take();
 
-        let mut locks = self.locks.lock();
+        let mut locks = self.locks.shard(&self.path);
         if locks
             .get(&self.path)
             .is_some_and(|lock| lock.strong_count() == 0)
@@ -67,12 +98,11 @@ impl Drop for PathInvalidationGuard {
 
 impl Drop for PathAccessGuard {
     fn drop(&mut self) {
-        if let Ok(mut pending_accesses) = self.pending_accesses.lock() {
-            if let Some(count) = pending_accesses.get_mut(&self.path) {
-                *count -= 1;
-                if *count == 0 {
-                    pending_accesses.remove(&self.path);
-                }
+        let mut pending_accesses = self.pending_accesses.shard(&self.path);
+        if let Some(count) = pending_accesses.get_mut(&self.path) {
+            *count -= 1;
+            if *count == 0 {
+                pending_accesses.remove(&self.path);
             }
         }
     }
@@ -103,6 +133,7 @@ pub(crate) struct FileBatch {
     cache: Arc<AsyncRwLock<Cache<PathBuf, FileLock>>>,
     backend: Arc<AsyncRwLock<Backend>>,
     batches: Arc<AsyncRwLock<BatchRegistry>>,
+    defer_local_sync: bool,
 }
 
 /// A cache to keep file descriptors open
@@ -116,7 +147,7 @@ pub(crate) struct FileCache {
     stop_sync_worker: Arc<AtomicBool>,
     backend: Arc<AsyncRwLock<Backend>>,
     batches: Arc<AsyncRwLock<BatchRegistry>>,
-    pending_accesses: Arc<Mutex<HashMap<PathBuf, usize>>>,
+    pending_accesses: PendingAccesses,
     invalidating_paths: PathLocks,
     sync_interval: Arc<RwLock<Duration>>,
     read_only: Arc<AtomicBool>,
@@ -156,9 +187,9 @@ impl FileCache {
         let backpack_clone = Arc::clone(&backpack);
         let batches = Arc::new(AsyncRwLock::new(BatchRegistry::default()));
         let batches_clone = Arc::clone(&batches);
-        let pending_accesses = Arc::new(Mutex::new(HashMap::new()));
+        let pending_accesses: PendingAccesses = Arc::new(PathShards::new());
         let pending_accesses_clone = Arc::clone(&pending_accesses);
-        let invalidating_paths: PathLocks = Arc::new(parking_lot::Mutex::new(HashMap::new()));
+        let invalidating_paths: PathLocks = Arc::new(PathShards::new());
         let sync_interval = Arc::new(RwLock::new(sync_interval));
         let sync_interval_clone = Some(Arc::clone(&sync_interval));
         let read_only = Arc::new(AtomicBool::new(false));
@@ -204,7 +235,7 @@ impl FileCache {
         backend: &Arc<AsyncRwLock<Backend>>,
         cache: &Arc<AsyncRwLock<Cache<PathBuf, FileLock>>>,
         batches: &Arc<AsyncRwLock<BatchRegistry>>,
-        pending_accesses: &Arc<Mutex<HashMap<PathBuf, usize>>>,
+        pending_accesses: &PendingAccesses,
         sync_interval: &Option<Arc<RwLock<Duration>>>,
     ) -> Result<(), ReductError> {
         if read_only.load(Ordering::Relaxed) {
@@ -225,9 +256,12 @@ impl FileCache {
             // Keep the registry read lock until the backend has conditionally removed the
             // candidate. This makes the decision atomic with starting a scoped mutation batch.
             let batch_registry = batches.read().await?;
-            if Self::registry_protects_path(&batch_registry, &path)
-                || Self::has_pending_access(pending_accesses, &path)?
-            {
+            let protected = if backend.read().await?.guards_eviction() {
+                batch_registry.path_owners.contains_key(&path)
+            } else {
+                Self::registry_protects_path(&batch_registry, &path)
+            };
+            if protected || Self::has_pending_access(pending_accesses, &path)? {
                 continue;
             }
             if let Some(file) = cache.remove(&path) {
@@ -368,7 +402,9 @@ impl FileCache {
         for (path, file) in discarded {
             if let Some(mut lock) = file.try_write_owned() {
                 discarded_count += 1;
-                if lock.mode() == &AccessMode::ReadWrite && !lock.is_synced() {
+                if lock.mode() == &AccessMode::ReadWrite
+                    && !(lock.is_synced() && lock.is_locally_synced())
+                {
                     if !Self::is_batched(&self.batches, &path).await? {
                         lock.sync_all().await.unwrap_or_else(|err| {
                             debug!("Failed to sync discarded file {:?}: {}", path, err);
@@ -434,6 +470,7 @@ impl FileCache {
             cache: Arc::clone(&self.cache),
             backend: Arc::clone(&self.backend),
             batches: Arc::clone(&self.batches),
+            defer_local_sync: false,
         })
     }
 
@@ -696,7 +733,9 @@ impl FileCache {
             let file = self.cache.write().await?.remove(&file_path);
             if let Some(file) = file {
                 let mut lock = file.write_owned().await?;
-                if lock.mode() == &AccessMode::ReadWrite && !lock.is_synced() {
+                if lock.mode() == &AccessMode::ReadWrite
+                    && !(lock.is_synced() && lock.is_locally_synced())
+                {
                     if let Err(err) = lock.sync_all().await {
                         warn!("Failed to sync file {}: {}", file_path.display(), err);
                     }
@@ -748,6 +787,10 @@ impl FileCache {
     pub async fn get_stats(&self, path: &PathBuf) -> Result<Option<ObjectMetadata>, ReductError> {
         let backpack = self.backend.read().await?;
         Ok(backpack.get_stats(path).await?)
+    }
+
+    pub async fn archive_info(&self) -> Result<Option<ArchiveInfo>, ReductError> {
+        Ok(self.backend.read().await?.archive_info())
     }
 
     pub async fn force_sync_all(&self) -> Result<(), ReductError> {
@@ -809,13 +852,13 @@ impl FileCache {
     }
 
     fn reserve_access(
-        pending_accesses: &Arc<Mutex<HashMap<PathBuf, usize>>>,
+        pending_accesses: &PendingAccesses,
         path: &Path,
     ) -> Result<PathAccessGuard, ReductError> {
-        let mut accesses = pending_accesses
-            .lock()
-            .map_err(|err| internal_server_error!("Failed to lock pending accesses: {}", err))?;
-        *accesses.entry(path.to_path_buf()).or_default() += 1;
+        *pending_accesses
+            .shard(path)
+            .entry(path.to_path_buf())
+            .or_default() += 1;
         Ok(PathAccessGuard {
             path: path.to_path_buf(),
             pending_accesses: Arc::clone(pending_accesses),
@@ -823,27 +866,23 @@ impl FileCache {
     }
 
     fn has_pending_access(
-        pending_accesses: &Arc<Mutex<HashMap<PathBuf, usize>>>,
+        pending_accesses: &PendingAccesses,
         path: &Path,
     ) -> Result<bool, ReductError> {
-        Ok(pending_accesses
-            .lock()
-            .map_err(|err| internal_server_error!("Failed to lock pending accesses: {}", err))?
-            .contains_key(path))
+        Ok(pending_accesses.shard(path).contains_key(path))
     }
 
     async fn lock_path(&self, path: &PathBuf) -> Result<PathInvalidationGuard, ReductError> {
         let lock = {
-            let mut locks = self.invalidating_paths.lock();
-            locks
-                .entry(path.clone())
-                .or_insert_with(std::sync::Weak::new)
-                .upgrade()
-                .unwrap_or_else(|| {
+            let mut locks = self.invalidating_paths.shard(path);
+            match locks.get(path).and_then(std::sync::Weak::upgrade) {
+                Some(lock) => lock,
+                None => {
                     let lock = Arc::new(AsyncRwLock::new(()));
                     locks.insert(path.clone(), Arc::downgrade(&lock));
                     lock
-                })
+                }
+            }
         };
 
         Ok(PathInvalidationGuard {
@@ -974,6 +1013,12 @@ impl FileCache {
 impl FileBatch {
     pub fn token(&self) -> BatchToken {
         self.token.clone()
+    }
+
+    /// Chooses whether the following syncs may leave the local sync of files that
+    /// the backend stores in place to the periodic sync of the file cache.
+    pub fn set_defer_local_sync(&mut self, defer: bool) {
+        self.defer_local_sync = defer;
     }
 
     /// Synchronizes one file and waits until its remote upload completes.
@@ -1116,7 +1161,10 @@ impl FileBatch {
     async fn sync_path(&mut self, path: &Path, version: Option<u64>) -> Result<(), ReductError> {
         let cached_file = self.cache.read().await?.get(&path.to_path_buf()).cloned();
         if let Some(file) = cached_file {
-            file.write().await?.sync_all_in_batch(self.token.id).await?;
+            file.write()
+                .await?
+                .sync_all_in_batch(self.token.id, self.defer_local_sync)
+                .await?;
         } else {
             let mut options = self.backend.read().await?.open_options();
             let open_result = options.write(true).read(true).open(path).await;
@@ -1138,7 +1186,7 @@ impl FileBatch {
                 Err(err) => return Err(err.into()),
             };
             file.flush_local().await?;
-            file.sync_all_in_batch(self.token.id).await?;
+            file.sync_all_in_batch(self.token.id, false).await?;
         }
         if let Some(version) = version {
             let mut batches = self.batches.write().await?;
@@ -1974,6 +2022,7 @@ mod tests {
             cache: Arc::clone(&cache.cache),
             backend: Arc::clone(&cache.backend),
             batches: Arc::clone(&cache.batches),
+            defer_local_sync: false,
         };
         batch.commit().await.unwrap();
         assert_eq!(

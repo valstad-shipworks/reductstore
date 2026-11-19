@@ -1,6 +1,7 @@
 // Copyright 2021-2026 ReductSoftware UG
 // Licensed under the Apache License, Version 2.0
 
+pub mod archive;
 pub mod benchmark;
 pub mod io;
 pub mod limits;
@@ -19,6 +20,7 @@ use crate::api::limits::{LimitsBuilder, LimitsConfig};
 use crate::asset::asset_manager::create_asset_manager;
 use crate::auth::token_auth::TokenAuthorization;
 use crate::backend::{Backend, BackendType, GeneralBackendConfig};
+use crate::cfg::archive::ArchiveConfig;
 use crate::cfg::benchmark::BenchmarkApiConfig;
 use crate::cfg::io::IoConfig;
 use crate::cfg::lock_file::LockFileConfig;
@@ -192,6 +194,7 @@ impl Default for Cfg {
 pub struct CoreExtCfg {
     pub role: InstanceRole,
     pub data_path: PathBuf,
+    pub archive: Option<ArchiveConfig>,
 }
 
 #[async_trait]
@@ -226,6 +229,24 @@ impl ExtCfgBounds for CoreExtCfg {
 
     fn data_path(&self) -> PathBuf {
         self.data_path.clone()
+    }
+
+    #[cfg(feature = "fs-backend")]
+    async fn init_backend(&self) -> Result<Backend, ReductError> {
+        use crate::backend::archive::ArchiveBackend;
+
+        match &self.archive {
+            Some(archive) if self.role != InstanceRole::Replica => {
+                let backend = ArchiveBackend::try_new(self.data_path(), archive.clone()).await?;
+                Ok(Backend::from_backend(Box::new(backend)))
+            }
+            _ => {
+                Backend::builder()
+                    .local_data_path(self.data_path())
+                    .try_build()
+                    .await
+            }
+        }
     }
 }
 
@@ -269,6 +290,7 @@ impl<EnvGetter: GetEnv + Send> ExtCfgParser<EnvGetter> for CoreExtCfgParser {
         CoreExtCfg {
             role,
             data_path: PathBuf::from(env.get("RS_DATA_PATH", "/data".to_string())),
+            archive: archive::parse_archive_config(env),
         }
     }
 }
@@ -756,6 +778,7 @@ mod tests {
             ext_cfg: CoreExtCfg {
                 role: InstanceRole::Primary,
                 data_path: data_path.clone(),
+                archive: None,
             },
             file_cache,
         };
@@ -784,6 +807,7 @@ mod tests {
             ext_cfg: CoreExtCfg {
                 role: InstanceRole::Primary,
                 data_path: data_path.clone(),
+                archive: None,
             },
             file_cache: Arc::clone(&file_cache),
         };

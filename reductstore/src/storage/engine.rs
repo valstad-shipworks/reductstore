@@ -251,6 +251,7 @@ impl StorageEngine {
                 bucket: self.cfg.bucket_defaults.clone(),
             },
             license: self.license.read().await?.clone(),
+            archive: self.file_cache.archive_info().await?,
         })
     }
 
@@ -796,6 +797,7 @@ mod tests {
                     bucket: Bucket::defaults(),
                 },
                 license: None,
+                archive: None,
             }
         );
     }
@@ -1134,6 +1136,7 @@ mod tests {
                         bucket: Bucket::defaults(),
                     },
                     license: None,
+                    archive: None,
                 }
             );
 
@@ -1277,6 +1280,7 @@ mod tests {
                         bucket: Bucket::defaults(),
                     },
                     license: None,
+                    archive: None,
                 }
             );
         }

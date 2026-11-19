@@ -518,6 +518,7 @@ mod tests {
             ext_cfg: crate::cfg::CoreExtCfg {
                 role: crate::cfg::InstanceRole::Primary,
                 data_path: data_path.clone(),
+                archive: None,
             },
             file_cache,
         }

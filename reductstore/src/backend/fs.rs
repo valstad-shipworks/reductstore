@@ -91,6 +91,10 @@ impl StorageBackend for FileSystemBackend {
         Ok(false)
     }
 
+    fn stores_in_place(&self) -> bool {
+        true
+    }
+
     async fn remove_from_local_cache(&self, _path: &Path) -> std::io::Result<()> {
         // do nothing because filesystem backend does not have a cache
         Ok(())

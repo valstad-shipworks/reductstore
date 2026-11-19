@@ -217,7 +217,6 @@ pub(super) async fn write_local_in_batch(
         .await?;
     file.set_len(0)?;
     file.write_all(&publication.encode())?;
-    file.flush_local().await?;
     Ok(path)
 }
 

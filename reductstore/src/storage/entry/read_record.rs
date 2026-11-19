@@ -58,7 +58,10 @@ impl Entry {
             ));
         }
 
-        RecordReader::try_new(self.block_manager.clone(), block_ref, time, None, None).await
+        let reader =
+            RecordReader::try_new(self.block_manager.clone(), block_ref, time, None, None).await?;
+        reader.prepare().await?;
+        Ok(reader)
     }
 
     async fn find_record_for_read(&self, time: u64) -> Result<(BlockRef, Record), ReductError> {

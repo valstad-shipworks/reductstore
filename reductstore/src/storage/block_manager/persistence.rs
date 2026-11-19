@@ -55,8 +55,10 @@ impl BlockManager {
             return Ok(());
         }
 
+        // Only a block that is in the local storage has something to sync. Asking the
+        // backend instead would open, and thereby fetch, a block it keeps elsewhere.
         let path = self.path_to_data(block_id);
-        if !self.file_cache.try_exists(&path).await? {
+        if !path.try_exists()? {
             return Ok(());
         }
 

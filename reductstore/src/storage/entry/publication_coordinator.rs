@@ -182,7 +182,7 @@ impl PublicationCoordinator {
     async fn publish_scheduled(&self, path: &Path) -> Result<Option<BatchToken>, ReductError> {
         let _publisher = self.publisher.lock().await;
         let mut guard = Arc::clone(&self.admission).write_owned().await;
-        let Some(token) = self.begin_publication(path).await? else {
+        let Some(token) = self.begin_publication(path, true).await? else {
             return Ok(None);
         };
 
@@ -210,7 +210,7 @@ impl PublicationCoordinator {
             // A remote delete may also unlink its local cache path. Run deferred deletes only
             // while mutations are excluded so a stale delete cannot remove a recreated WAL.
             self.sync_pending_deletes().await?;
-            self.finish_publication(path).await?;
+            self.finish_publication(path, true).await?;
             return Ok(Some(token));
         }
     }
@@ -229,15 +229,22 @@ impl PublicationCoordinator {
     }
 
     async fn publish_exclusive(&self, path: &Path) -> Result<Option<BatchToken>, ReductError> {
-        let Some(token) = self.begin_publication(path).await? else {
+        let Some(token) = self.begin_publication(path, false).await? else {
             return Ok(None);
         };
         self.sync_pending_batch().await?;
-        self.finish_publication(path).await?;
+        self.finish_publication(path, false).await?;
         Ok(Some(token))
     }
 
-    async fn begin_publication(&self, path: &Path) -> Result<Option<BatchToken>, ReductError> {
+    /// `defer_local_sync` is set by the scheduled publisher: it runs after every
+    /// burst of writes, so it leaves durability to the periodic sync of the file
+    /// cache where the backend allows it instead of syncing each file it publishes.
+    async fn begin_publication(
+        &self,
+        path: &Path,
+        defer_local_sync: bool,
+    ) -> Result<Option<BatchToken>, ReductError> {
         let Some(token) = self
             .batch
             .lock()
@@ -263,12 +270,17 @@ impl PublicationCoordinator {
         };
         let marker_path =
             publication::write_local_in_batch(&token, path, &updating, &self.file_cache).await?;
-        self.sync_pending_file(&marker_path).await?;
+        self.sync_pending_file(&marker_path, defer_local_sync)
+            .await?;
         *self.marker.lock().await = Some(updating.clone());
         Ok(Some(token))
     }
 
-    async fn finish_publication(&self, path: &Path) -> Result<(), ReductError> {
+    async fn finish_publication(
+        &self,
+        path: &Path,
+        defer_local_sync: bool,
+    ) -> Result<(), ReductError> {
         let token = self
             .batch
             .lock()
@@ -288,7 +300,8 @@ impl PublicationCoordinator {
         let ready = updating.ready(index.crc64())?;
         let marker_path =
             publication::write_local_in_batch(&token, path, &ready, &self.file_cache).await?;
-        self.sync_pending_file(&marker_path).await?;
+        self.sync_pending_file(&marker_path, defer_local_sync)
+            .await?;
         *self.marker.lock().await = Some(ready);
 
         let mut pending = self
@@ -312,8 +325,13 @@ impl PublicationCoordinator {
         }
     }
 
-    async fn sync_pending_file(&self, path: &Path) -> Result<(), ReductError> {
+    async fn sync_pending_file(
+        &self,
+        path: &Path,
+        defer_local_sync: bool,
+    ) -> Result<(), ReductError> {
         let mut file_batch = self.take_file_batch().await?;
+        file_batch.set_defer_local_sync(defer_local_sync);
         let result = file_batch.sync_file(path).await;
         self.restore_file_batch(file_batch).await?;
         result
@@ -321,6 +339,7 @@ impl PublicationCoordinator {
 
     async fn sync_pending_batch(&self) -> Result<(), ReductError> {
         let mut file_batch = self.take_file_batch().await?;
+        file_batch.set_defer_local_sync(false);
         let result = file_batch.sync_all().await;
         self.restore_file_batch(file_batch).await?;
         result
@@ -328,6 +347,7 @@ impl PublicationCoordinator {
 
     async fn sync_pending_files(&self) -> Result<(), ReductError> {
         let mut file_batch = self.take_file_batch().await?;
+        file_batch.set_defer_local_sync(true);
         let result = file_batch.sync_files().await;
         #[cfg(test)]
         if let Some(pause) = self.sync_pause.lock().await.take() {
@@ -487,7 +507,7 @@ mod tests {
         let file_cache = build_test_file_cache();
         let coordinator = PublicationCoordinator::new_with_cache(file_cache.clone());
         drop(coordinator.begin_mutation(&path).await.unwrap());
-        coordinator.begin_publication(&path).await.unwrap();
+        coordinator.begin_publication(&path, false).await.unwrap();
 
         let token = coordinator
             .batch
@@ -505,13 +525,13 @@ mod tests {
         drop(pending);
 
         assert_eq!(
-            coordinator.finish_publication(&path).await.unwrap_err(),
+            coordinator.finish_publication(&path, false).await.unwrap_err(),
             internal_server_error!("Cannot commit file batch with pending remote mutations")
         );
         assert!(coordinator.batch.lock().await.is_some());
 
         coordinator.sync_pending_batch().await.unwrap();
-        coordinator.finish_publication(&path).await.unwrap();
+        coordinator.finish_publication(&path, false).await.unwrap();
         assert!(coordinator.batch.lock().await.is_none());
     }
 
@@ -525,7 +545,7 @@ mod tests {
         let token = admission.token.clone();
         drop(admission);
 
-        coordinator.begin_publication(&path).await.unwrap();
+        coordinator.begin_publication(&path, false).await.unwrap();
         coordinator.sync_pending_batch().await.unwrap();
 
         let mut data = file_cache
@@ -536,7 +556,7 @@ mod tests {
         drop(data);
 
         assert_eq!(
-            coordinator.finish_publication(&path).await.unwrap_err(),
+            coordinator.finish_publication(&path, false).await.unwrap_err(),
             reduct_base::internal_server_error!(
                 "Cannot commit file batch with pending remote mutations"
             )

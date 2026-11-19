@@ -299,7 +299,14 @@ impl Bucket {
                     .get_mut(&entry_name)
                     .and_then(|opt| opt.take())
                 {
-                    if tx.send(Ok(reader)).await.is_err() {
+                    // Done here rather than where the entry produces the reader, so that
+                    // a slow fetch does not let records of other entries overtake it.
+                    let reader = match reader.prepare().await {
+                        Ok(()) => Ok(reader),
+                        Err(err) => Err(err),
+                    };
+                    let failed = reader.is_err();
+                    if tx.send(reader).await.is_err() || failed {
                         break;
                     }
                 }

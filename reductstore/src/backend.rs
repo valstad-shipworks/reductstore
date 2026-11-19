@@ -2,6 +2,8 @@
 // Licensed under the Apache License, Version 2.0
 
 #[cfg(feature = "fs-backend")]
+pub(crate) mod archive;
+#[cfg(feature = "fs-backend")]
 pub(super) mod fs;
 
 pub mod file;
@@ -12,6 +14,7 @@ use crate::backend::noop::NoopBackend;
 use async_trait::async_trait;
 use reduct_base::error::ReductError;
 use reduct_base::internal_server_error;
+use reduct_base::msg::server_api::ArchiveInfo;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -53,6 +56,28 @@ pub trait StorageBackend {
     async fn get_stats(&self, path: &Path) -> std::io::Result<Option<ObjectMetadata>>;
 
     async fn remove_from_local_cache(&self, path: &Path) -> std::io::Result<()>;
+
+    /// Called before a file is opened, ahead of the check whether it exists locally.
+    async fn prepare_open(&self, _path: &Path, _mode: &AccessMode) -> std::io::Result<()> {
+        Ok(())
+    }
+
+    /// Whether `remove_from_local_cache_if_unused` itself rules out that the file
+    /// was touched since it was offered. Such a candidate need not wait for the
+    /// mutation batches that are open on its directory, only for one that owns it.
+    fn guards_eviction(&self) -> bool {
+        false
+    }
+
+    fn archive_info(&self) -> Option<ArchiveInfo> {
+        None
+    }
+
+    /// Whether the local files are the stored files, so that `upload` has no
+    /// data to transfer and a reader of the storage sees a write without a sync.
+    fn stores_in_place(&self) -> bool {
+        false
+    }
 }
 
 pub type BoxedBackend = Box<dyn StorageBackend + Send + Sync>;
@@ -187,6 +212,14 @@ impl Backend {
         self.backend
             .remove_from_local_cache_if_unused(path.as_ref())
             .await
+    }
+
+    pub fn guards_eviction(&self) -> bool {
+        self.backend.guards_eviction()
+    }
+
+    pub fn archive_info(&self) -> Option<ArchiveInfo> {
+        self.backend.archive_info()
     }
 
     /// Remove the file only from local cache, without affecting remote storage.

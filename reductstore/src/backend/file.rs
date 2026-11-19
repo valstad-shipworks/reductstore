@@ -84,6 +84,7 @@ impl OpenOptions {
 
         let backend_path = self.backend.path().clone();
         let full_path = backend_path.join(path.as_ref());
+        self.backend.prepare_open(&full_path, &self.mode).await?;
         if create {
             if let Some(parent) = full_path.parent() {
                 if parent != backend_path.as_path() {
@@ -136,14 +137,28 @@ impl File {
     }
 
     pub async fn sync_all(&mut self) -> std::io::Result<()> {
-        self.sync_all_authorized(None).await
+        self.sync_all_authorized(None, false).await
     }
 
-    pub(crate) async fn sync_all_in_batch(&mut self, batch_id: u64) -> std::io::Result<()> {
-        self.sync_all_authorized(Some(batch_id)).await
+    /// Makes the file visible in the storage backend as part of `batch_id`.
+    ///
+    /// With `defer_local_sync` a backend that stores files in place skips the
+    /// local sync, which it does not need for visibility, and leaves durability
+    /// to the periodic sync of the file cache.
+    pub(crate) async fn sync_all_in_batch(
+        &mut self,
+        batch_id: u64,
+        defer_local_sync: bool,
+    ) -> std::io::Result<()> {
+        self.sync_all_authorized(Some(batch_id), defer_local_sync)
+            .await
     }
 
-    async fn sync_all_authorized(&mut self, batch_id: Option<u64>) -> std::io::Result<()> {
+    async fn sync_all_authorized(
+        &mut self,
+        batch_id: Option<u64>,
+        defer_local_sync: bool,
+    ) -> std::io::Result<()> {
         if self.ignore_write {
             return Ok(());
         }
@@ -155,20 +170,21 @@ impl File {
             ));
         }
 
-        if self.is_synced() {
+        let defer_local_sync = defer_local_sync && self.backend.stores_in_place();
+        if self.is_synced && (self.is_locally_synced || defer_local_sync) {
             return Ok(());
         }
 
         debug!("File {} synced to storage backend", self.path.display());
 
-        if !self.is_locally_synced {
+        if !self.is_locally_synced && !defer_local_sync {
             Self::run_blocking_io(|| self.inner.sync_all())?;
+            self.last_local_sync = Instant::now();
+            self.is_locally_synced = true;
         }
         self.backend.upload(&self.path).await?;
         self.last_synced = Instant::now();
-        self.last_local_sync = self.last_synced;
         self.is_synced = true;
-        self.is_locally_synced = true;
         Ok(())
     }
 
@@ -453,6 +469,56 @@ mod tests {
 
         #[rstest]
         #[tokio::test(flavor = "current_thread")]
+        async fn test_deferred_batch_sync_skips_local_sync_in_place(
+            mut mock_backend: MockBackend,
+        ) {
+            mock_backend.expect_stores_in_place().return_const(true);
+            mock_backend.expect_upload().times(2).returning(|_| Ok(()));
+
+            let mut file = OpenOptions::new(Arc::new(Box::new(mock_backend)))
+                .write(true)
+                .open("test.txt")
+                .await
+                .unwrap();
+            file.write_all(b" more").unwrap();
+
+            file.sync_all_in_batch(1, true).await.unwrap();
+            assert!(file.is_synced());
+            assert!(!file.is_locally_synced());
+
+            file.sync_all().await.unwrap();
+            assert!(file.is_synced());
+            assert!(file.is_locally_synced());
+        }
+
+        #[rstest]
+        #[case(false, true)]
+        #[case(true, false)]
+        #[tokio::test(flavor = "current_thread")]
+        async fn test_batch_sync_keeps_local_sync(
+            mut mock_backend: MockBackend,
+            #[case] stores_in_place: bool,
+            #[case] defer_local_sync: bool,
+        ) {
+            mock_backend
+                .expect_stores_in_place()
+                .return_const(stores_in_place);
+            mock_backend.expect_upload().times(1).returning(|_| Ok(()));
+
+            let mut file = OpenOptions::new(Arc::new(Box::new(mock_backend)))
+                .write(true)
+                .open("test.txt")
+                .await
+                .unwrap();
+            file.write_all(b" more").unwrap();
+
+            file.sync_all_in_batch(1, defer_local_sync).await.unwrap();
+            assert!(file.is_synced());
+            assert!(file.is_locally_synced());
+        }
+
+        #[rstest]
+        #[tokio::test(flavor = "current_thread")]
         async fn test_is_sync_after_write(mock_backend: MockBackend) {
             let mut file = OpenOptions::new(Arc::new(Box::new(mock_backend)))
                 .write(true)
@@ -585,6 +651,7 @@ mod tests {
             async fn remove_from_local_cache_if_unused(&self, path: &Path) -> std::io::Result<bool>;
             async fn get_stats(&self, path: &Path) -> std::io::Result<Option<ObjectMetadata>>;
             async fn remove_from_local_cache(&self, path: &Path) -> std::io::Result<()>;
+            fn stores_in_place(&self) -> bool;
         }
 
     }

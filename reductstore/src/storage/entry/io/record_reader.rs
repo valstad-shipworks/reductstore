@@ -7,7 +7,7 @@ use crate::storage::block_manager::{BlockFilePath, BlockManager, BlockRef};
 use crate::storage::engine::MAX_IO_BUFFER_SIZE;
 use crate::storage::proto::Record;
 use bytes::Bytes;
-use reduct_base::error::ReductError;
+use reduct_base::error::{ErrorCode, ReductError};
 use reduct_base::io::{ReadChunk, ReadRecord, RecordMeta};
 use reduct_base::{internal_server_error, not_found, too_early};
 use std::cmp::min;
@@ -109,6 +109,27 @@ impl RecordReader {
             _permit: permit,
             file_cache: Some(file_cache),
         })
+    }
+
+    /// Make sure the content of the record can be read.
+    ///
+    /// A block that the storage backend keeps elsewhere is fetched when its file is
+    /// opened. Calling this before a record is handed out fails the request with an
+    /// error instead of cutting off a response that has already started.
+    pub(crate) async fn prepare(&self) -> Result<(), ReductError> {
+        let (Some(path), Some(file_cache)) = (&self.file_path, &self.file_cache) else {
+            return Ok(());
+        };
+
+        let path = path.path();
+        match file_cache.read(path, SeekFrom::Current(0)).await {
+            Ok(_) => Ok(()),
+            Err(err) if path.exists() => Err(err),
+            Err(err) => Err(ReductError::new(
+                ErrorCode::ServiceUnavailable,
+                &err.message,
+            )),
+        }
     }
 
     /// Create a new record reader for a record with no content.
